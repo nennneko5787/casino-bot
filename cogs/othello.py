@@ -466,6 +466,9 @@ class ChallengeView(discord.ui.View):
                 "あなたへの指名ではありません", ephemeral=True
             )
             return
+        # 自分のロビー登録を先に外す (is_busy が自分のロビーに反応しないよう)
+        self.cog.lobbies.discard(self.host_id)
+        self.cog.lobby_views.pop(self.host_id, None)
         if self.cog.is_busy(self.host_id) or self.cog.is_busy(self.guest_id):
             await interaction.response.send_message(
                 "対戦者の都合で開始できませんでした", ephemeral=True
@@ -481,7 +484,6 @@ class ChallengeView(discord.ui.View):
             await self._expire("残高不足のため中止しました")
             return
         await interaction.response.defer()
-        self.cog.lobbies.discard(self.host_id)
         host_data.amount -= self.bet
         guest_data.amount -= self.bet
         await saveUser(host_data)
@@ -490,6 +492,8 @@ class ChallengeView(discord.ui.View):
         message = interaction.message
         assert message is not None
         await self.cog.start_pvp(message, self.host_id, self.guest_id, self.bet, lock)
+        # 開始後はロビーのタイムアウトを止める (期限切れ表示で盤面を上書きしないよう)
+        self.stop()
 
     @discord.ui.button(label="断る", style=discord.ButtonStyle.danger)
     async def decline(
@@ -502,6 +506,7 @@ class ChallengeView(discord.ui.View):
             return
         await interaction.response.defer()
         self.cog.lobbies.discard(self.host_id)
+        self.cog.lobby_views.pop(self.host_id, None)
         await self._expire("指名は断られました")
 
     def _decide_first(self) -> bool:
@@ -522,6 +527,7 @@ class ChallengeView(discord.ui.View):
 
     async def on_timeout(self):
         self.cog.lobbies.discard(self.host_id)
+        self.cog.lobby_views.pop(self.host_id, None)
         await self._expire("応答がなかったため指名は期限切れになりました")
 
 
@@ -548,10 +554,14 @@ class OpenLobbyView(discord.ui.View):
                 "主催者は参加ボタンではなく開始を待ってください", ephemeral=True
             )
             return
+        # 自分のロビー登録を先に外す (is_busy が自分のロビーに反応しないよう)
+        self.cog.lobbies.discard(self.host_id)
+        self.cog.lobby_views.pop(self.host_id, None)
         if self.cog.is_busy(interaction.user.id) or self.cog.is_busy(self.host_id):
             await interaction.response.send_message(
                 "対戦を開始できませんでした", ephemeral=True
             )
+            await self._expire("対戦を開始できませんでした")
             return
         host_data = await getUser(await self.cog.bot.fetch_user(self.host_id))
         guest_data = await getUser(interaction.user)
@@ -559,9 +569,9 @@ class OpenLobbyView(discord.ui.View):
             await interaction.response.send_message(
                 "残高が足りないため開始できません", ephemeral=True
             )
+            await self._expire("残高不足のため中止しました")
             return
         await interaction.response.defer()
-        self.cog.lobbies.discard(self.host_id)
         host_data.amount -= self.bet
         guest_data.amount -= self.bet
         await saveUser(host_data)
@@ -577,6 +587,8 @@ class OpenLobbyView(discord.ui.View):
         message = interaction.message
         assert message is not None
         await self.cog.start_pvp_direct(message, black_id, white_id, self.bet)
+        # 開始後はロビーのタイムアウトを止める (期限切れ表示で盤面を上書きしないよう)
+        self.stop()
 
     @discord.ui.button(label="募集を取り消す", style=discord.ButtonStyle.danger)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -587,24 +599,22 @@ class OpenLobbyView(discord.ui.View):
             return
         await interaction.response.defer()
         self.cog.lobbies.discard(self.host_id)
+        self.cog.lobby_views.pop(self.host_id, None)
+        await self._expire("募集は取り消されました")
+
+    async def _expire(self, text: str):
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
         if self.message:
             with suppress(discord.DiscordException):
-                await self.message.edit(content="募集は取り消されました", view=self)
+                await self.message.edit(content=text, view=self)
         self.stop()
 
     async def on_timeout(self):
         self.cog.lobbies.discard(self.host_id)
-        for item in self.children:
-            if isinstance(item, discord.ui.Button):
-                item.disabled = True
-        if self.message:
-            with suppress(discord.DiscordException):
-                await self.message.edit(
-                    content="応募がなかったため募集は期限切れになりました", view=self
-                )
+        self.cog.lobby_views.pop(self.host_id, None)
+        await self._expire("応募がなかったため募集は期限切れになりました")
 
 
 class OthelloRematchView(discord.ui.View):
@@ -666,6 +676,7 @@ class OthelloCog(commands.Cog):
         self.bot = bot
         self.games: dict[int, dict] = {}
         self.lobbies: set[int] = set()
+        self.lobby_views: dict[int, ChallengeView | OpenLobbyView] = {}
         self._next_game_id = 1
         self.tiles: dict = unicode_tiles()
 
@@ -712,13 +723,19 @@ class OthelloCog(commands.Cog):
                 "othello: カスタム絵文字を使えないため代替表示します (%s)", e
             )
 
-    def is_busy(self, user_id: int) -> bool:
+    def busy_reason(self, user_id: int) -> str | None:
+        """募集中のロビー持ちなら募集中、対局中なら対局中。どちらでもなければ None。"""
         if user_id in self.lobbies:
-            return True
-        return any(
+            return "募集中"
+        if any(
             g["black_id"] == user_id or g["white_id"] == user_id
             for g in self.games.values()
-        )
+        ):
+            return "対局中"
+        return None
+
+    def is_busy(self, user_id: int) -> bool:
+        return self.busy_reason(user_id) is not None
 
     def _new_game_id(self) -> int:
         gid = self._next_game_id
@@ -1086,9 +1103,21 @@ class OthelloCog(commands.Cog):
         if opponent.id == ctx.author.id:
             await ctx.reply("自分自身とは対戦できません", ephemeral=True)
             return
-        if self.is_busy(ctx.author.id) or self.is_busy(opponent.id):
+        busy = [
+            (uid, label)
+            for uid, label in (
+                (ctx.author.id, "あなた"),
+                (opponent.id, "相手"),
+            )
+            if self.is_busy(uid)
+        ]
+        if busy:
+            detail = "・".join(
+                f"{label}(<@{uid}>: {self.busy_reason(uid)})" for uid, label in busy
+            )
+            logger.info("othello-vs blocked: %s", detail)
             await ctx.reply(
-                "どちらかが進行中・募集中のゲームを抱えています", ephemeral=True
+                f"開始できません: {detail} が進行中・募集中です", ephemeral=True
             )
             return
         user_data = await getUser(ctx.author)
@@ -1098,6 +1127,7 @@ class OthelloCog(commands.Cog):
         self.lobbies.add(ctx.author.id)
         order = host_first.value if host_first else "random"
         view = ChallengeView(self, ctx.author.id, opponent.id, bet, order)
+        self.lobby_views[ctx.author.id] = view
         await ctx.reply("OK", ephemeral=True)
         msg = await ctx.channel.send(
             f"{opponent.mention} さん、<@{ctx.author.id}> からのオセロ対戦指名です！\n"
@@ -1140,6 +1170,7 @@ class OthelloCog(commands.Cog):
         self.lobbies.add(ctx.author.id)
         order = host_first.value if host_first else "random"
         view = OpenLobbyView(self, ctx.author.id, bet, order)
+        self.lobby_views[ctx.author.id] = view
         await ctx.reply("OK", ephemeral=True)
         msg = await ctx.channel.send(
             f"{ctx.author.mention} がオセロの対戦相手を募集中！やりたい人はボタンを押してください⚔️\n"
@@ -1147,6 +1178,20 @@ class OthelloCog(commands.Cog):
             view=view,
         )
         view.message = msg
+
+    @commands.hybrid_command(
+        "othello-cancel", brief="自分の募集中ロビーを強制取り消しします"
+    )
+    @commands.guild_only()
+    async def othelloCancelCommand(self, ctx: commands.Context):
+        """詰まったロビーが残った場合の復旧用。対局中の取り消しはできない。"""
+        self.lobbies.discard(ctx.author.id)
+        view = self.lobby_views.pop(ctx.author.id, None)
+        if view is None:
+            await ctx.reply("取り消せる募集中ロビーはありません", ephemeral=True)
+            return
+        await view._expire("募集は取り消されました")
+        await ctx.reply("募集中ロビーを取り消しました", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
