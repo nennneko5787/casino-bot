@@ -27,8 +27,10 @@ class PaymentCog(commands.Cog):
         userData.amount += amount
         await saveUser(userData)
 
-        await ctx.reply(
-            f"{to.mention}\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
+        await ctx.reply("送金しました", ephemeral=True)
+
+        await ctx.channel.send(
+            f"{ctx.author.mention} から\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
         )
 
     @commands.hybrid_command("send", brief="他のメンバーに所持金を譲渡します")
@@ -50,8 +52,10 @@ class PaymentCog(commands.Cog):
         await saveUser(userData)
         await saveUser(toData)
 
-        await ctx.reply(
-            f"{ctx.author.mention}\n```patch\n{buildGetAmountText(-amount, md=True)}\n\n{to.mention}\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
+        await ctx.reply("送金しました", ephemeral=True)
+
+        await ctx.channel.send(
+            f"{ctx.author.mention} から\n```patch\n{buildGetAmountText(-amount, md=True)}\n\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
         )
 
 

@@ -2,7 +2,9 @@ import asyncio
 import math
 import os
 import random
+from contextlib import suppress
 
+import discord
 import dotenv
 from discord import app_commands
 from discord.ext import commands
@@ -12,6 +14,57 @@ from services.message import buildGetAmountText
 from services.money import getUser, saveUser
 
 dotenv.load_dotenv()
+
+
+class SlotRetryView(discord.ui.View):
+    def __init__(self, cog: "SlotCog", author_id: int, amount: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.author_id = author_id
+        self.amount = amount
+        self.spinning = False
+
+    @discord.ui.button(
+        label="もう一度引く", style=discord.ButtonStyle.success, emoji="🔁"
+    )
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "あなたのスロットではありません", ephemeral=True
+            )
+            return
+        if self.spinning:
+            await interaction.response.send_message(
+                "回転中です...しばらくお待ちください", ephemeral=True
+            )
+            return
+
+        message = interaction.message
+        assert message is not None
+
+        self.spinning = True
+        button.disabled = True
+        with suppress(discord.DiscordException):
+            await message.edit(view=self)
+        # spin 側で編集するため先に defer して二重応答を防ぐ (済みなら無視)
+        with suppress(discord.DiscordException):
+            await interaction.response.defer()
+
+        try:
+            await self.cog.spin(message, interaction.user, self.amount, view=self)
+        except AmountNotEnough:
+            await interaction.followup.send("所持金が足りません。", ephemeral=True)
+        except YouMustDie:
+            await interaction.followup.send("※対策済みです", ephemeral=True)
+        except Exception:  # noqa: BLE001 - ボタン操作では予期せぬ失敗も画面に返す
+            await interaction.followup.send(
+                "スロットの実行中にエラーが発生しました。", ephemeral=True
+            )
+        finally:
+            self.spinning = False
+            button.disabled = False
+            with suppress(discord.DiscordException):
+                await message.edit(view=self)
 
 
 class SlotCog(commands.Cog):
@@ -108,6 +161,64 @@ class SlotCog(commands.Cog):
 
         return 0
 
+    async def spin(
+        self,
+        message: discord.Message,
+        user: discord.User | discord.Member,
+        amount: int,
+        *,
+        view: SlotRetryView | None = None,
+    ) -> int:
+        """スロットを1回回して結果を message に反映する。戻り値は reward。"""
+        if amount < 0:
+            raise YouMustDie()
+        preCheck = await getUser(user)
+        if preCheck.amount < amount:
+            raise AmountNotEnough()
+
+        slotOutputs = random.choices(
+            self.emojis,
+            weights=self.weights,
+            k=3,
+        )
+
+        await message.edit(content=f"{self.slot}" * 3, view=view)
+
+        await asyncio.sleep(1)
+
+        for i in range(3):
+            await asyncio.sleep(0.35)
+
+            await message.edit(
+                content=("".join(slotOutputs[: i + 1]) + f"{self.slot}" * (2 - i)),
+                view=view,
+            )
+
+        multiplier = self.getMultiplier(slotOutputs)
+
+        if multiplier > 0:
+            reward = math.ceil(amount * multiplier)
+        else:
+            reward = -amount
+
+        userData = await getUser(user)
+        userData.amount += reward
+        await saveUser(userData)
+
+        if view is None:
+            view = SlotRetryView(self, user.id, amount)
+
+        await message.edit(
+            content=(
+                f"{''.join(slotOutputs)}\n"
+                "```patch\n"
+                f"{buildGetAmountText(reward, md=True)}\n"
+                "```"
+            ),
+            view=view,
+        )
+        return reward
+
     @commands.hybrid_command("slot", brief="スロットを引きます")
     @app_commands.rename(amount="賭ける額")
     @app_commands.describe(amount="賭ける事ができます")
@@ -124,42 +235,9 @@ class SlotCog(commands.Cog):
         if userData.amount < amount:
             raise AmountNotEnough()
 
-        slotRotating = f"{self.slot}" * 3
-        message = await ctx.reply(content=slotRotating)
+        message = await ctx.reply(content=f"{self.slot}" * 3)
 
-        slotOutputs = random.choices(
-            self.emojis,
-            weights=self.weights,
-            k=3,
-        )
-
-        await asyncio.sleep(1)
-
-        for i in range(3):
-            await asyncio.sleep(0.35)
-
-            await message.edit(
-                content=("".join(slotOutputs[: i + 1]) + f"{self.slot}" * (2 - i))
-            )
-
-        multiplier = self.getMultiplier(slotOutputs)
-
-        if multiplier > 0:
-            reward = math.ceil(amount * multiplier)
-        else:
-            reward = -amount
-
-        userData.amount += reward
-        await saveUser(userData)
-
-        await message.edit(
-            content=(
-                f"{''.join(slotOutputs)}\n"
-                "```patch\n"
-                f"{buildGetAmountText(reward, md=True)}\n"
-                "```"
-            )
-        )
+        await self.spin(message, ctx.author, amount)
 
 
 async def setup(bot: commands.Bot):
