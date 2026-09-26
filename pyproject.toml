@@ -16,6 +16,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pillow>=12.3.0",
     "ruff>=0.16.9",
     "ty>=0.0.84",
 ]

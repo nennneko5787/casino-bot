@@ -1,18 +1,25 @@
 """オセロ: CPU戦 / 指名対戦 / 参加者募集の3モード。"""
 
 import asyncio
+import logging
+import os
 import random
 from contextlib import suppress
 from copy import deepcopy
 from sqlite3 import Error as SQLiteError
 
 import discord
+import dotenv
 from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, CasinoBaseException, YouMustDie
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
+
+dotenv.load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 BLACK = 1
 WHITE = 2
@@ -43,6 +50,21 @@ MOVES_PER_PAGE = 20  # ボタン4行分。残り1行はページ送り/降参用
 def move_letter(i: int) -> str:
     """0 -> 🇦, 1 -> 🇧, ... のリージョナルインジケータ。"""
     return chr(REGIONAL_BASE + i)
+
+
+def unicode_tiles() -> dict:
+    """カスタム絵文字が無い場合の代替タイル。"""
+    return {
+        "black": "⚫",
+        "white": "⚪",
+        "empty": "🟩",
+        "letters": [move_letter(i) for i in range(26)],
+    }
+
+
+def _env_id(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else None
 
 
 # ---------- エンジン ----------
@@ -186,24 +208,30 @@ def coord_name(r: int, c: int) -> str:
 
 
 def render_board(
-    board: list[list[int]], hints: dict[tuple[int, int], str] | None = None
+    board: list[list[int]],
+    tiles: dict,
+    hints: dict[tuple[int, int], str] | None = None,
 ) -> str:
-    """hints: {(r, c): 表示絵文字}。置けるマスに🇦〜などの文字を表示する。"""
+    """hints: {(r, c): 表示タイル}。置けるマスに文字タイルを表示する。
+
+    カスタム絵文字はコードブロック内では描画されないため fences 無し。
+    全タイルが正方形の絵文字なら盤面が揃う。
+    """
     hints = hints or {}
-    lines = ["＼" + " ".join(COL_FW)]
+    lines = ["＼ " + " ".join(COL_FW)]
     for r in range(8):
-        line = ROW_FW[r]
+        line = ROW_FW[r] + " "
         for c in range(8):
             if board[r][c] == BLACK:
-                line += "⚫"
+                line += tiles["black"]
             elif board[r][c] == WHITE:
-                line += "⚪"
+                line += tiles["white"]
             elif (r, c) in hints:
                 line += hints[(r, c)]
             else:
-                line += "🟩"
+                line += tiles["empty"]
         lines.append(line)
-    return "```\n" + "\n".join(lines) + "\n```"
+    return "\n".join(lines)
 
 
 def color_emoji(color: int) -> str:
@@ -359,7 +387,7 @@ class OthelloGameView(discord.ui.View):
         await message.edit(
             embed=self.cog.build_game_embed(
                 game,
-                self.cog.hint_markers(game),
+                self.cog.hint_markers(game, self.cog.tiles),
                 self.notice,
                 view.page,
                 view.page_count,
@@ -639,6 +667,50 @@ class OthelloCog(commands.Cog):
         self.games: dict[int, dict] = {}
         self.lobbies: set[int] = set()
         self._next_game_id = 1
+        self.tiles: dict = unicode_tiles()
+
+    async def cog_load(self):
+        """slot.py と同じ方式で盤面タイルのカスタム絵文字を取得する。
+
+        必要な環境変数: othello_black / othello_white / othello_empty (絵文字ID)、
+        othello_letters (A〜Zの絵文字IDをカンマ区切りで26個)。
+        取得できなければ代替のユニコード表示にフォールバックする。
+        """
+        try:
+            black_id = _env_id("othello_black")
+            white_id = _env_id("othello_white")
+            empty_id = _env_id("othello_empty")
+            letter_ids = [
+                part.strip()
+                for part in os.environ.get("othello_letters", "").split(",")
+            ]
+            if (
+                not black_id
+                or not white_id
+                or not empty_id
+                or len(letter_ids) != 26
+                or not all(part.isdigit() for part in letter_ids)
+            ):
+                raise ValueError("othello用絵文字の環境変数が不足しています")
+            black = await self.bot.fetch_application_emoji(black_id)
+            white = await self.bot.fetch_application_emoji(white_id)
+            empty = await self.bot.fetch_application_emoji(empty_id)
+            letters = await asyncio.gather(
+                *(self.bot.fetch_application_emoji(int(part)) for part in letter_ids)
+            )
+            if not black or not white or not empty or not all(letters):
+                raise ValueError("othello用絵文字の取得に失敗しました")
+            self.tiles = {
+                "black": str(black),
+                "white": str(white),
+                "empty": str(empty),
+                "letters": [str(emoji) for emoji in letters],
+            }
+            logger.info("othello: カスタム絵文字タイルを使用します")
+        except (ValueError, discord.DiscordException) as e:
+            logger.warning(
+                "othello: カスタム絵文字を使えないため代替表示します (%s)", e
+            )
 
     def is_busy(self, user_id: int) -> bool:
         if user_id in self.lobbies:
@@ -718,11 +790,12 @@ class OthelloCog(commands.Cog):
     # ----- 進行 -----
 
     @staticmethod
-    def hint_markers(game: dict) -> dict[tuple[int, int], str]:
-        """置けるマス -> 盤面に表示する文字。読む順に🇦🇧🇨...を割り当てる。"""
+    def hint_markers(game: dict, tiles: dict) -> dict[tuple[int, int], str]:
+        """置けるマス -> 盤面に表示する文字タイル。読む順に割り当てる。"""
         markers: dict[tuple[int, int], str] = {}
+        letters = tiles.get("letters", [])
         for i, (r, c) in enumerate(legal_moves(game["board"], game["turn"])):
-            markers[(r, c)] = move_letter(i) if i < 26 else "🟨"
+            markers[(r, c)] = letters[i] if i < len(letters) else "🟨"
         return markers
 
     def build_game_embed(
@@ -744,7 +817,7 @@ class OthelloCog(commands.Cog):
         desc = f"{desc_head}\n手番: {turn_text} {color_emoji(game['turn'])}"
         if notice:
             desc += f"\n{notice}"
-        desc += "\n" + render_board(game["board"], hints)
+        desc += "\n" + render_board(game["board"], self.tiles, hints)
         embed = discord.Embed(
             title=title, description=desc, color=discord.Color.random()
         )
@@ -798,7 +871,11 @@ class OthelloCog(commands.Cog):
             view.message = message
             await message.edit(
                 embed=self.build_game_embed(
-                    game, self.hint_markers(game), notice, view.page, view.page_count
+                    game,
+                    self.hint_markers(game, self.tiles),
+                    notice,
+                    view.page,
+                    view.page_count,
                 ),
                 view=view,
             )
@@ -905,7 +982,7 @@ class OthelloCog(commands.Cog):
             title="オセロ [対局終了]",
             description=(
                 f"⚫<@{game['black_id']}> vs ⚪<@{game['white_id']}>\n"
-                f"{desc_extra}\n" + render_board(game["board"])
+                f"{desc_extra}\n" + render_board(game["board"], self.tiles)
             ),
             color=color,
         )
