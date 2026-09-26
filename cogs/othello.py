@@ -1140,8 +1140,9 @@ class OthelloCog(commands.Cog):
         self.lobbies.add(ctx.author.id)
         order = host_first.value if host_first else "random"
         view = OpenLobbyView(self, ctx.author.id, bet, order)
-        msg = await ctx.reply(
-            f"<@{ctx.author.id}> がオセロの対戦相手を募集中！やりたい人はボタンを押してください⚔️\n"
+        await ctx.reply("OK", ephemeral=True)
+        msg = await ctx.channel.send(
+            f"{ctx.author.mention} がオセロの対戦相手を募集中！やりたい人はボタンを押してください⚔️\n"
             f"掛け金: {buildAmountText(bet)} (勝者は {buildAmountText(int(bet * 2 * PVP_RAKE))} を獲得)",
             view=view,
         )
