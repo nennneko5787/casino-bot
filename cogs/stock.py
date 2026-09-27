@@ -1,4 +1,8 @@
-"""株価: 売買 + 折れ線チャート + 管理者の銘柄追加。"""
+"""株価: 売買 + 折れ線チャート + 管理者の銘柄追加。
+
+一般: /stock buy|sell|chart|portfolio|list
+管理者: /stock-admin add|delist|relist|params
+"""
 
 import asyncio
 import logging
@@ -39,9 +43,17 @@ class StockCog(commands.Cog):
     async def _before_tick(self):
         await self.bot.wait_until_ready()
 
-    # ---------- 一般コマンド ----------
+    # ---------- /stock グループ ----------
 
-    @commands.hybrid_command("stock-list", brief="上場中の銘柄一覧を表示します")
+    @commands.hybrid_group(name="stock", brief="株取引をします")
+    @commands.guild_only()
+    async def stock(self, ctx: commands.Context):
+        await ctx.reply(
+            "サブコマンドを指定してください: buy / sell / chart / portfolio / list",
+            ephemeral=True,
+        )
+
+    @stock.command(name="list", brief="上場中の銘柄一覧を表示します")
     @commands.guild_only()
     async def stockListCommand(self, ctx: commands.Context):
         items = await stocks.get_stocks(active_only=False)
@@ -62,7 +74,7 @@ class StockCog(commands.Cog):
             )
         )
 
-    @commands.hybrid_command("stock-buy", brief="株を買います")
+    @stock.command(name="buy", brief="株を買います")
     @app_commands.rename(ticker="銘柄", qty="数量")
     @app_commands.describe(ticker="例: NEKO", qty="買う株数")
     @commands.guild_only()
@@ -90,7 +102,7 @@ class StockCog(commands.Cog):
             )
         )
 
-    @commands.hybrid_command("stock-sell", brief="株を売ります")
+    @stock.command(name="sell", brief="株を売ります")
     @app_commands.rename(ticker="銘柄", qty="数量")
     @app_commands.describe(ticker="例: NEKO", qty="売る株数")
     @commands.guild_only()
@@ -116,7 +128,7 @@ class StockCog(commands.Cog):
             )
         )
 
-    @commands.hybrid_command("stock-chart", brief="株価の折れ線チャートを表示します")
+    @stock.command(name="chart", brief="株価の折れ線チャートを表示します")
     @app_commands.rename(ticker="銘柄", count="件数")
     @app_commands.describe(ticker="例: NEKO", count="直近何件を描くか (最大200)")
     @commands.guild_only()
@@ -147,7 +159,7 @@ class StockCog(commands.Cog):
         embed.set_image(url=f"attachment://{CHART_NAME}")
         await ctx.reply(embed=embed, attachments=[file])
 
-    @commands.hybrid_command("stock-portfolio", brief="保有株と評価額を表示します")
+    @stock.command(name="portfolio", brief="保有株と評価額を表示します")
     @commands.guild_only()
     async def stockPortfolioCommand(self, ctx: commands.Context):
         items = await stocks.get_portfolio(ctx.author.id)
@@ -174,9 +186,18 @@ class StockCog(commands.Cog):
             )
         )
 
-    # ---------- 管理者コマンド ----------
+    # ---------- /stock-admin グループ ----------
 
-    @commands.hybrid_command("stock-add", brief="※管理者専用 銘柄を追加します")
+    @commands.hybrid_group(name="stock-admin", brief="※管理者専用 銘柄を管理します")
+    @commands.has_guild_permissions(administrator=True)
+    @commands.guild_only()
+    async def stockAdmin(self, ctx: commands.Context):
+        await ctx.reply(
+            "サブコマンドを指定してください: add / delist / relist / params",
+            ephemeral=True,
+        )
+
+    @stockAdmin.command(name="add", brief="※管理者専用 銘柄を追加します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(
@@ -219,7 +240,7 @@ class StockCog(commands.Cog):
             f"(mu={stock.mu} sigma={stock.sigma})"
         )
 
-    @commands.hybrid_command("stock-delist", brief="※管理者専用 銘柄を取扱停止します")
+    @stockAdmin.command(name="delist", brief="※管理者専用 銘柄を取扱停止します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
@@ -231,7 +252,7 @@ class StockCog(commands.Cog):
             return
         await ctx.reply(f"`{stock.ticker}` を取扱停止しました（売却は可能）")
 
-    @commands.hybrid_command("stock-relist", brief="※管理者専用 取扱停止を解除します")
+    @stockAdmin.command(name="relist", brief="※管理者専用 取扱停止を解除します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
@@ -243,7 +264,7 @@ class StockCog(commands.Cog):
             return
         await ctx.reply(f"`{stock.ticker}` の取扱を再開しました")
 
-    @commands.hybrid_command("stock-params", brief="※管理者専用 mu/sigmaを変更します")
+    @stockAdmin.command(name="params", brief="※管理者専用 mu/sigmaを変更します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma")
