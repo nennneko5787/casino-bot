@@ -302,7 +302,7 @@ class LevelCog(commands.Cog):
     @levelAdmin.command(name="add", brief="※管理者専用 XPを付与します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
-    @app_commands.rename(member="対象", amount="XP量")
+    @app_commands.rename(member="対象", amount="xp量")
     @app_commands.describe(amount="付与するXP量 (1以上)", member="付与対象")
     async def levelAddCommand(
         self, ctx: commands.Context, member: discord.Member, amount: int
