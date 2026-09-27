@@ -14,7 +14,7 @@ MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 
 ユーザーは会社を設立できる (1人1社、設立手数料1000+投資金、
 開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定、
-創業者株の付与 + 売買ロイヤリティあり)。
+創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
 自社株は買増不可・売却のみ可。
 価格1が24時間続いた会社は破産 (運営・ユーザー問わず):
 保有株は紙くず・会社データは消去・元オーナーは再設立可。
@@ -49,6 +49,7 @@ FOUNDING_FEE = 1000
 # 設立者メリット
 ROYALTY_RATE = 0.01  # 他人が自社株を売買するたび、代金のこの割合が設立者に入る
 FOUNDER_SHARES_PER = 1000  # この投資額ごとに創業者株1株 (最低1株、売却のみ可)
+DIVIDEND_RATE = 0.001  # tickで値上がりしたら、上昇分×保有株数×この割合を配当
 
 # 破産: 価格1がこの時間続いたら破産
 BANKRUPT_FLOOR_HOURS = 24
@@ -291,6 +292,7 @@ async def tick_once(
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
 
     価格1の滞在を追跡し、24時間続いた会社は破産させる (運営・ユーザー問わず)。
+    値上がりしたユーザー企業には創業者配当を付与する。
     戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id}])。
     """
     rng = rng or random.Random()
@@ -373,8 +375,15 @@ async def tick_once(
             "ORDER BY id DESC LIMIT ?)",
             (stock.ticker, stock.ticker, HISTORY_KEEP),
         )
+        gain = new_price - stock.price
         stock.price = new_price
         updated.append(stock)
+        if gain > 0 and stock.owner_id is not None:
+            # 創業者配当。失敗してもtick全体は止めない。
+            try:
+                await _grant_founder_dividend(stock, gain)
+            except Exception:
+                logger.exception("創業者配当の付与に失敗 ticker=%s", stock.ticker)
     # 通貨価値指数用のスナップショット (平均株価 + 通貨総量) を記録
     cursor = await DBService.pool.execute(
         "SELECT AVG(price) AS a FROM stocks WHERE is_active = 1"
@@ -559,21 +568,51 @@ async def _credit_royalty(owner_id: int | None, base: int) -> int:
     royalty = min(int(base * ROYALTY_RATE), SQLITE_MAX_INT)
     if royalty < 1:
         return 0
+    await _add_user_amount(owner_id, royalty)
+    return royalty
+
+
+async def _add_user_amount(user_id: int, amount: int) -> None:
+    """ユーザー残高を加算 (上限 SQLITE_MAX_INT で丸める)。行がなければ作る。"""
+    if amount < 1:
+        return
     await DBService.pool.execute(
-        "INSERT OR IGNORE INTO users(id) VALUES (?)", (owner_id,)
+        "INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,)
     )
     cursor = await DBService.pool.execute(
-        "SELECT amount FROM users WHERE id = ?", (owner_id,)
+        "SELECT amount FROM users WHERE id = ?", (user_id,)
     )
     row = await cursor.fetchone()
     await cursor.close()
     balance = row["amount"] if row else 100
     await DBService.pool.execute(
         "UPDATE users SET amount = ? WHERE id = ?",
-        (min(balance + royalty, SQLITE_MAX_INT), owner_id),
+        (min(balance + amount, SQLITE_MAX_INT), user_id),
     )
     await DBService.pool.commit()
-    return royalty
+
+
+async def _grant_founder_dividend(stock: Stock, gain: int) -> int:
+    """創業者配当: 値上がり分×設立者の保有株数×DIVIDEND_RATEを付与。
+
+    株を持ち続けるほど配当が増える (売ると将来の配当が減る)。
+    戻り値は付与額。値下がり・保有なし・運営銘柄は0。
+    """
+    if stock.owner_id is None or gain <= 0:
+        return 0
+    cursor = await DBService.pool.execute(
+        "SELECT qty FROM holdings WHERE user_id = ? AND ticker = ?",
+        (stock.owner_id, stock.ticker),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row or row["qty"] < 1:
+        return 0
+    dividend = min(int(gain * row["qty"] * DIVIDEND_RATE), SQLITE_MAX_INT)
+    if dividend < 1:
+        return 0
+    await _add_user_amount(stock.owner_id, dividend)
+    return dividend
 
 
 async def create_company(
