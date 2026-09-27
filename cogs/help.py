@@ -99,7 +99,13 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     stock.add_field(
         name="/stock buy [銘柄] [数量] / /stock sell [銘柄] [数量]",
-        value="株を売買する。取扱停止中は買えない (売りは可)",
+        value="株を売買する。取扱停止中は買えない (売りは可)。"
+        "自社株は売却のみ可。他人の会社の売買では代金の1%が設立者に還元される",
+        inline=False,
+    )
+    stock.add_field(
+        name="/stock create [銘柄] [投資額]",
+        value="会社を設立 (1人1社)。投資額でランク・条件が決まり、創業者株 (売却のみ可) が付く",
         inline=False,
     )
     stock.add_field(

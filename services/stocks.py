@@ -13,8 +13,9 @@ mu/sigma は管理者が数値で直接指定できる (原案) ほか、
 MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 
 ユーザーは会社を設立できる (1人1社、設立手数料1000+投資金、
-開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定)。
-自社株の売買は不可。
+開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定、
+創業者株の付与 + 売買ロイヤリティあり)。
+自社株は買増不可・売却のみ可。
 価格1が24時間続いた会社は破産 (運営・ユーザー問わず):
 保有株は紙くず・会社データは消去・元オーナーは再設立可。
 """
@@ -44,6 +45,10 @@ MAX_PRICE = 1_000_000_000_000  # 1兆。初期価格(数百〜数千)から十�
 
 # 会社設立の手数料 (消滅)。mu ボーナス等の優遇は下の INVEST_RANKS による。
 FOUNDING_FEE = 1000
+
+# 設立者メリット
+ROYALTY_RATE = 0.01  # 他人が自社株を売買するたび、代金のこの割合が設立者に入る
+FOUNDER_SHARES_PER = 1000  # この投資額ごとに創業者株1株 (最低1株、売却のみ可)
 
 # 破産: 価格1がこの時間続いたら破産
 BANKRUPT_FLOOR_HOURS = 24
@@ -538,6 +543,39 @@ def rank_for_invest(invest: int) -> InvestRank:
     return INVEST_RANKS[-1][1]
 
 
+def founder_shares_for(invest: int) -> int:
+    """投資額に応じた創業者株数。1000ごとに1株、最低1株。"""
+    return max(invest // FOUNDER_SHARES_PER, 1)
+
+
+async def _credit_royalty(owner_id: int | None, base: int) -> int:
+    """売買ロイヤリティ (代金×ROYALTY_RATE) を設立者に付与。戻り値は付与額。
+
+    運営負担の鋳造方式 (売主・買主の金額は変わらない)。端数切捨てで
+    1未満はスキップする。自分の売買は対象外 (呼び出し側で除外する)。
+    """
+    if owner_id is None:
+        return 0
+    royalty = min(int(base * ROYALTY_RATE), SQLITE_MAX_INT)
+    if royalty < 1:
+        return 0
+    await DBService.pool.execute(
+        "INSERT OR IGNORE INTO users(id) VALUES (?)", (owner_id,)
+    )
+    cursor = await DBService.pool.execute(
+        "SELECT amount FROM users WHERE id = ?", (owner_id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    balance = row["amount"] if row else 100
+    await DBService.pool.execute(
+        "UPDATE users SET amount = ? WHERE id = ?",
+        (min(balance + royalty, SQLITE_MAX_INT), owner_id),
+    )
+    await DBService.pool.commit()
+    return royalty
+
+
 async def create_company(
     user_id: int,
     ticker: str,
@@ -547,6 +585,7 @@ async def create_company(
 
     開始株価=投資金。mu/sigma/impactは投資額ランクで自動決定され、
     指定はできない (管理者の add/params のみ数値・プリセット指定可)。
+    設立者には投資額1000ごとに1株 (最低1株) の創業者株を付与する。
     戻り値は設立した銘柄。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     """
@@ -595,6 +634,10 @@ async def create_company(
     await DBService.pool.execute(
         "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
         (ticker, invest, now),
+    )
+    await DBService.pool.execute(
+        "INSERT INTO holdings (user_id, ticker, qty, avg_cost) VALUES (?, ?, ?, ?)",
+        (user_id, ticker, founder_shares_for(invest), invest),
     )
     await DBService.pool.commit()
     stock = await get_stock(ticker)
@@ -689,12 +732,13 @@ def resolve_impact(
     return 0.0005
 
 
-async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
-    """購入。戻り値は (約定単価, 合計金額, 需給変動率)。
+async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float, int]:
+    """購入。戻り値は (約定単価, 合計金額, 需給変動率, ロイヤリティ額)。
 
     残高の増減も直接SQLで行うため Discord オブジェクトは不要。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     約定後に需給影響を即時反映する (約定単価は影響前の価格)。
+    他人の会社を買った場合、代金の ROYALTY_RATE が設立者に還元される。
     """
     ticker = normalize_ticker(ticker)
     if qty < 1:
@@ -754,13 +798,19 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
         )
     await DBService.pool.commit()
     _, rate = await apply_impact(ticker, qty)
-    return stock.price, cost, rate
+    royalty = await _credit_royalty(stock.owner_id, cost)
+    return stock.price, cost, rate, royalty
 
 
-async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, float]:
-    """売却。戻り値は (約定単価, 受取金額, 借金への自動返済額, 需給変動率).
+async def sell(
+    user_id: int, ticker: str, qty: int
+) -> tuple[int, int, int, float, int]:
+    """売却。戻り値は (約定単価, 受取金額, 借金への自動返済額, 需給変動率, ロイヤリティ額).
 
-    上場廃止銘柄も売却は可能。受取金額は借金返済優先で配分される。
+    上場廃止銘柄も売却は可能。自社株は売却のみ可 (買増は不可)。
+    受取金額は借金返済優先で配分される。
+    他人の会社の株を売った場合、代金の ROYALTY_RATE が設立者に還元される
+    (自分の売買は対象外)。
     約定後に需給影響を即時反映する (約定単価は影響前の価格)。
     """
     from services.loan import apply_income
@@ -773,8 +823,6 @@ async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, floa
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
-    if stock.owner_id is not None and stock.owner_id == user_id:
-        raise ValueError(f"{ticker} は自分の会社なので売れません")
     cursor = await DBService.pool.execute(
         "SELECT * FROM holdings WHERE user_id = ? AND ticker = ?",
         (user_id, ticker),
@@ -798,7 +846,10 @@ async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, floa
     await DBService.pool.commit()
     repaid, _ = await apply_income(user_id, proceeds)
     _, rate = await apply_impact(ticker, -qty)
-    return stock.price, proceeds, repaid, rate
+    royalty = 0
+    if stock.owner_id is not None and stock.owner_id != user_id:
+        royalty = await _credit_royalty(stock.owner_id, proceeds)
+    return stock.price, proceeds, repaid, rate, royalty
 
 
 async def get_portfolio(user_id: int) -> list[dict]:

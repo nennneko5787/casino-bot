@@ -4,7 +4,8 @@
 管理者: /stock-admin add|delist|relist|params|set-price
 
 会社は1人1社まで (設立手数料1000+投資金、開始株価=投資金、
-mu/sigma/impactは投資額ランクで自動決定)。自社株の売買は不可。
+mu/sigma/impactは投資額ランクで自動決定、創業者株+売買ロイヤリティあり)。
+自社株は買増不可・売却のみ可。
 価格1が24時間続いた会社は破産 (保有株は紙くず・会社消去)。
 """
 
@@ -148,7 +149,7 @@ class StockCog(commands.Cog):
             await ctx.reply("数量は1以上にしてください", ephemeral=True)
             return
         try:
-            price, cost, rate = await stocks.buy(ctx.author.id, ticker, qty)
+            price, cost, rate, royalty = await stocks.buy(ctx.author.id, ticker, qty)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
@@ -158,6 +159,11 @@ class StockCog(commands.Cog):
         with suppress(Exception):
             await missions.record_event(ctx.author.id, "trade")
             await missions.record_event(ctx.author.id, "trade_buy")
+        royalty_note = (
+            f"\n創業者ロイヤリティ {buildAmountText(royalty)} が設立者に還元されました"
+            if royalty > 0
+            else ""
+        )
         await ctx.reply(
             embed=discord.Embed(
                 title="株を購入📈",
@@ -166,7 +172,7 @@ class StockCog(commands.Cog):
                     f"`{ticker.strip().upper()}` を {qty}株 @"
                     f"{buildAmountText(price)}\n"
                     f"```patch\n{buildGetAmountText(-cost, md=True)}\n```"
-                    f"\n需給影響 {rate:+.2%} で価格が動きました"
+                    f"\n需給影響 {rate:+.2%} で価格が動きました" + royalty_note
                 ),
                 color=discord.Color.green(),
             )
@@ -182,7 +188,7 @@ class StockCog(commands.Cog):
             await ctx.reply("数量は1以上にしてください", ephemeral=True)
             return
         try:
-            price, proceeds, repaid, rate = await stocks.sell(
+            price, proceeds, repaid, rate, royalty = await stocks.sell(
                 ctx.author.id, ticker, qty
             )
         except ValueError as e:
@@ -191,6 +197,11 @@ class StockCog(commands.Cog):
         # ミッション: 株取引を記録 (失敗してもゲームは続行)
         with suppress(Exception):
             await missions.record_event(ctx.author.id, "trade")
+        royalty_note = (
+            f"\n創業者ロイヤリティ {buildAmountText(royalty)} が設立者に還元されました"
+            if royalty > 0
+            else ""
+        )
         await ctx.reply(
             embed=discord.Embed(
                 title="株を売却💰",
@@ -201,6 +212,7 @@ class StockCog(commands.Cog):
                     f"```patch\n{buildGetAmountText(proceeds, md=True)}\n```"
                     + repay_note(repaid)
                     + f"\n需給影響 {rate:+.2%} で価格が動きました"
+                    + royalty_note
                 ),
                 color=discord.Color.gold(),
             )
@@ -387,6 +399,7 @@ class StockCog(commands.Cog):
         except LookupError:
             raise AmountNotEnough()
         rank = stocks.rank_for_invest(invest)
+        founder_shares = stocks.founder_shares_for(invest)
         await ctx.reply(
             f"🏢 `{stock.ticker}` を設立しました！\n"
             f"設立費用: {buildAmountText(stocks.FOUNDING_FEE + invest)}"
@@ -395,8 +408,10 @@ class StockCog(commands.Cog):
             f"開始株価: {buildAmountText(stock.price)}"
             f" (ランク{rank.name}: mu={stock.mu} sigma={stock.sigma}"
             f" impact={stock.impact})\n"
+            f"創業者株 {founder_shares}株を付与 (売却のみ可・買増不可)\n"
             "※投資額が多いほど好条件 (S: 5万〜 / A: 2万〜 / B: 5千〜 / C: 〜5千未満)\n"
-            "※自分の会社の株は売買できません"
+            "※他人が自社株を売買するたび、代金の1%がロイヤリティで入ります\n"
+            "※自分の会社の株の買増はできません"
         )
 
     @stock.command(name="retire", brief="自分の会社を取扱停止します")
