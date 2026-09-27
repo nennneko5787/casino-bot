@@ -1,7 +1,11 @@
-"""株価: 売買 + 折れ線チャート + 管理者の銘柄追加。
+"""株価: 売買 + 会社設立 + 折れ線チャート + 管理者の銘柄追加。
 
-一般: /stock buy|sell|chart|portfolio|list
-管理者: /stock-admin add|delist|relist|params
+一般: /stock buy|sell|create|retire|reopen|chart|currency|portfolio|list
+管理者: /stock-admin add|delist|relist|params|set-price
+
+会社は1人1社まで (設立手数料1000+投資金、開始株価=投資金、
+muに投資額ボーナス)。自社株の売買は不可。
+価格1が24時間続いた会社は破産 (保有株は紙くず・会社消去)。
 """
 
 import asyncio
@@ -16,7 +20,11 @@ from objects.exceptions import AmountNotEnough
 from services import missions, stocks
 from services.loan import repay_note
 from services.message import amountName, buildAmountText, buildGetAmountText
-from services.stock_chart import render_stock_chart
+from services.stock_chart import (
+    render_currency_chart,
+    render_multi_stock_chart,
+    render_stock_chart,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,21 +67,49 @@ class StockCog(commands.Cog):
     @tasks.loop(minutes=TICK_INTERVAL_MINUTES)
     async def tick_loop(self):
         try:
-            await stocks.tick_once()
+            _, bankrupted = await stocks.tick_once()
         except Exception:
             logger.exception("株価の定期更新に失敗")
+            return
+        for info in bankrupted:
+            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
+            msg = (
+                f"💸 `{info['ticker']}` が破産しました"
+                f"（価格1が{stocks.BANKRUPT_FLOOR_HOURS}時間継続）\n"
+                f"設立者: {owner}／保有株は紙くずになりました"
+            )
+            for guild in self.bot.guilds:
+                with suppress(Exception):
+                    ch = self._notify_channel(guild)
+                    if ch is not None:
+                        await ch.send(msg)
 
     @tick_loop.before_loop
     async def _before_tick(self):
         await self.bot.wait_until_ready()
 
+    def _notify_channel(
+        self, guild: discord.Guild | None
+    ) -> discord.TextChannel | None:
+        if guild is None:
+            return None
+        ch = guild.system_channel
+        if ch is not None and ch.permissions_for(guild.me).send_messages:
+            return ch
+        for c in guild.text_channels:
+            if c.permissions_for(guild.me).send_messages:
+                return c
+        return None
+
     # ---------- /stock グループ ----------
 
-    @commands.hybrid_group(name="stock", brief="株取引をします")
+    @commands.hybrid_group(name="stock", brief="株取引・会社設立をします")
     @commands.guild_only()
     async def stock(self, ctx: commands.Context):
         await ctx.reply(
-            "サブコマンドを指定してください: buy / sell / chart / portfolio / list",
+            "サブコマンドを指定してください: "
+            "buy / sell / create / retire / reopen / chart / currency / "
+            "portfolio / list",
             ephemeral=True,
         )
 
@@ -90,7 +126,10 @@ class StockCog(commands.Cog):
             else:
                 mark = ""
             status = "" if s.is_active else " [取扱停止]"
-            lines.append(f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}")
+            owner = f" [U:<@{s.owner_id}>]" if s.owner_id is not None else ""
+            lines.append(
+                f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{owner}"
+            )
         desc = "\n".join(lines) if lines else "銘柄がありません"
         await ctx.reply(
             embed=discord.Embed(
@@ -167,13 +206,46 @@ class StockCog(commands.Cog):
         )
 
     @stock.command(name="chart", brief="株価の折れ線チャートを表示します")
-    @app_commands.rename(ticker="銘柄", count="件数")
-    @app_commands.describe(ticker="例: NEKO", count="直近何件を描くか (最大200)")
-    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    @app_commands.rename(ticker="銘柄", count="件数", ticker2="銘柄2", all_stocks="全銘柄")
+    @app_commands.describe(
+        ticker="例: NEKO",
+        count="直近何件を描くか (最大200)",
+        ticker2="指定すると2銘柄の変化率を比較表示します",
+        all_stocks="オンにすると全銘柄の変化率を比較表示します",
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete, ticker2=ticker_autocomplete)
     @commands.guild_only()
     async def stockChartCommand(
-        self, ctx: commands.Context, ticker: str, count: int = 100
+        self,
+        ctx: commands.Context,
+        ticker: str,
+        count: int = 100,
+        ticker2: str | None = None,
+        all_stocks: bool = False,
     ):
+        if all_stocks:
+            items = await stocks.get_stocks(active_only=False)
+            if not items:
+                await ctx.reply("銘柄がありません", ephemeral=True)
+                return
+            histories: dict[str, list[tuple[str, int]]] = {}
+            for s in items:
+                histories[s.ticker] = await stocks.get_history(s.ticker, count)
+            buf = await asyncio.to_thread(
+                render_multi_stock_chart, histories, amountName
+            )
+            file = discord.File(buf, filename=CHART_NAME)
+            embed = discord.Embed(
+                title="全銘柄比較チャート📈",
+                description=(
+                    f"{len(histories)}銘柄・直近{count}件\n"
+                    "各銘柄は区間先頭を0%とした変化率で表示"
+                ),
+                color=discord.Color.blue(),
+            )
+            embed.set_image(url=f"attachment://{CHART_NAME}")
+            await ctx.reply(embed=embed, file=file)
+            return
         try:
             name = stocks.normalize_ticker(ticker)
         except ValueError as e:
@@ -182,6 +254,41 @@ class StockCog(commands.Cog):
         stock = await stocks.get_stock(name)
         if not stock:
             await ctx.reply(f"{name} は存在しません", ephemeral=True)
+            return
+        if ticker2:
+            try:
+                name2 = stocks.normalize_ticker(ticker2)
+            except ValueError as e:
+                await ctx.reply(str(e), ephemeral=True)
+                return
+            if name2 == name:
+                await ctx.reply("同じ銘柄同士は比較できません", ephemeral=True)
+                return
+            stock2 = await stocks.get_stock(name2)
+            if not stock2:
+                await ctx.reply(f"{name2} は存在しません", ephemeral=True)
+                return
+            histories = {
+                name: await stocks.get_history(name, count),
+                name2: await stocks.get_history(name2, count),
+            }
+            buf = await asyncio.to_thread(
+                render_multi_stock_chart, histories, amountName
+            )
+            file = discord.File(buf, filename=CHART_NAME)
+            embed = discord.Embed(
+                title=f"{name} vs {name2}📈",
+                description=(
+                    f"`{name}`: 現在{buildAmountText(stock.price)}"
+                    + ("" if stock.is_active else " [取扱停止]")
+                    + f"\n`{name2}`: 現在{buildAmountText(stock2.price)}"
+                    + ("" if stock2.is_active else " [取扱停止]")
+                    + "\n各銘柄は区間先頭を0%とした変化率で表示"
+                ),
+                color=discord.Color.blue(),
+            )
+            embed.set_image(url=f"attachment://{CHART_NAME}")
+            await ctx.reply(embed=embed, file=file)
             return
         history = await stocks.get_history(name, count)
         buf = await asyncio.to_thread(render_stock_chart, history, name, amountName)
@@ -194,6 +301,30 @@ class StockCog(commands.Cog):
                 + ("" if stock.is_active else "\n※取扱停止中")
             ),
             color=discord.Color.blue(),
+        )
+        embed.set_image(url=f"attachment://{CHART_NAME}")
+        await ctx.reply(embed=embed, file=file)
+
+    @stock.command(name="currency", brief="通貨の市場価値チャートを表示します")
+    @app_commands.rename(count="件数")
+    @app_commands.describe(count="直近何件を描くか (最大200)")
+    @commands.guild_only()
+    async def stockCurrencyCommand(self, ctx: commands.Context, count: int = 100):
+        points = await stocks.get_currency_index(count)
+        buf = await asyncio.to_thread(render_currency_chart, points)
+        file = discord.File(buf, filename=CHART_NAME)
+        if points:
+            desc = (
+                f"現在値: `{points[-1][1]:.1f}` (起点=100)\n"
+                "上がる=通貨高／下がる=通貨安\n"
+                "(株安・通貨供給減で上昇、株高・通貨増発で下落)"
+            )
+        else:
+            desc = "データがありません"
+        embed = discord.Embed(
+            title="通貨価値指数💱",
+            description=desc,
+            color=discord.Color.gold(),
         )
         embed.set_image(url=f"attachment://{CHART_NAME}")
         await ctx.reply(embed=embed, file=file)
@@ -234,6 +365,112 @@ class StockCog(commands.Cog):
             )
         )
 
+    @stock.command(name="create", brief="会社を設立します (1人1社)")
+    @app_commands.rename(
+        ticker="銘柄",
+        invest="投資額",
+        mu="mu",
+        sigma="sigma",
+        preset="プリセット",
+        impact="impact",
+        mu_preset="muプリセット",
+        impact_preset="impactプリセット",
+    )
+    @app_commands.describe(
+        ticker="英数字1〜10文字 (例: MYCO)",
+        invest="会社への投資額 (1以上)。開始株価になります",
+        mu="平均成長率 -1.0〜1.0 (省略時0)",
+        sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
+        preset="sigmaのプリセット。おまかせランダム可",
+        impact="需給感応度 0〜0.01/株 (省略時0.0005)",
+        mu_preset="muのプリセット。おまかせランダム可",
+        impact_preset="impactのプリセット。おまかせランダム可",
+    )
+    @app_commands.choices(
+        preset=[
+            app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
+            app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
+            app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
+        mu_preset=[
+            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
+            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
+            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
+        impact_preset=[
+            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
+            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
+            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
+    )
+    @commands.guild_only()
+    async def stockCreateCommand(
+        self,
+        ctx: commands.Context,
+        ticker: str,
+        invest: int,
+        mu: float | None = None,
+        sigma: float | None = None,
+        preset: app_commands.Choice[str] | None = None,
+        impact: float | None = None,
+        mu_preset: app_commands.Choice[str] | None = None,
+        impact_preset: app_commands.Choice[str] | None = None,
+    ):
+        try:
+            mu_val = stocks.resolve_mu(mu, mu_preset.value if mu_preset else None)
+            sigma_val = await stocks.resolve_sigma(
+                sigma, preset.value if preset else None
+            )
+            impact_val = stocks.resolve_impact(
+                impact, impact_preset.value if impact_preset else None
+            )
+            stock = await stocks.create_company(
+                ctx.author.id, ticker, invest, mu_val, sigma_val, impact_val
+            )
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        except LookupError:
+            raise AmountNotEnough()
+        bonus = stocks.founding_bonus_mu(invest)
+        await ctx.reply(
+            f"🏢 `{stock.ticker}` を設立しました！\n"
+            f"設立費用: {buildAmountText(stocks.FOUNDING_FEE + invest)}"
+            f" (手数料{buildAmountText(stocks.FOUNDING_FEE)}"
+            f"＋投資{buildAmountText(invest)})\n"
+            f"開始株価: {buildAmountText(stock.price)}"
+            f" (mu={stock.mu} sigma={stock.sigma} impact={stock.impact}"
+            f"・投資ボーナスmu+{bonus})\n"
+            "※自分の会社の株は売買できません"
+        )
+
+    @stock.command(name="retire", brief="自分の会社を取扱停止します")
+    @app_commands.rename(ticker="銘柄")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    @commands.guild_only()
+    async def stockRetireCommand(self, ctx: commands.Context, ticker: str):
+        try:
+            stock = await stocks.set_active_own(ctx.author.id, ticker, False)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(f"`{stock.ticker}` を取扱停止しました")
+
+    @stock.command(name="reopen", brief="自分の会社の取扱を再開します")
+    @app_commands.rename(ticker="銘柄")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    @commands.guild_only()
+    async def stockReopenCommand(self, ctx: commands.Context, ticker: str):
+        try:
+            stock = await stocks.set_active_own(ctx.author.id, ticker, True)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(f"`{stock.ticker}` の取扱を再開しました")
+
     # ---------- /stock-admin グループ ----------
 
     @commands.hybrid_group(name="stock-admin", brief="※管理者専用 銘柄を管理します")
@@ -241,7 +478,8 @@ class StockCog(commands.Cog):
     @commands.guild_only()
     async def stockAdmin(self, ctx: commands.Context):
         await ctx.reply(
-            "サブコマンドを指定してください: add / delist / relist / params",
+            "サブコマンドを指定してください: "
+            "add / delist / relist / params / set-price",
             ephemeral=True,
         )
 
@@ -345,6 +583,24 @@ class StockCog(commands.Cog):
             await ctx.reply(str(e), ephemeral=True)
             return
         await ctx.reply(f"`{stock.ticker}` の取扱を再開しました")
+
+    @stockAdmin.command(name="set-price", brief="※管理者専用 価格を直接設定します")
+    @commands.has_guild_permissions(administrator=True)
+    @commands.guild_only()
+    @app_commands.rename(ticker="銘柄", price="価格")
+    @app_commands.describe(ticker="例: GMO", price="設定する価格 (1以上)")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    async def stockSetPriceCommand(
+        self, ctx: commands.Context, ticker: str, price: int
+    ):
+        try:
+            stock = await stocks.set_price(ticker, price)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(
+            f"`{stock.ticker}` の価格を {buildAmountText(stock.price)} に設定しました"
+        )
 
     @stockAdmin.command(name="params", brief="※管理者専用 mu/sigma/impactを変更します")
     @commands.has_guild_permissions(administrator=True)

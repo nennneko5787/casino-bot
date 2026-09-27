@@ -1,12 +1,21 @@
-"""株価エンジン: 幾何ランダムウォーク + 売買 + 管理者銘柄追加。
+"""株価エンジン: 幾何ランダムウォーク + 売買 + 銘柄追加 + 破産。
 
 各銘柄は独立した乱数で更新されるため、同じように上がり下がりしない。
 mu/sigma は管理者が数値で直接指定できる (原案) ほか、
 簡単プリセット (おとなしい/ふつう/荒い) で sigma を決めることもできる。
 
+価格は整数だが、丸めは確率的 (期待値不変) にすることで
+価格1が吸着点にならないようにしている (1でも毎tick数%で脱出できる)。
+売買の需給影響も rate≠0 なら最低1は動く。
+
 売買による需給影響は自律変動を主役にするため、逓減 + 上限付き。
 少量ならほぼ線形 (impact × 数量) に動くが、大量注文でも
 MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
+
+ユーザーは会社を設立できる (1人1社、設立手数料1000+投資金、
+開始株価=投資金、muに投資額ボーナス)。自社株の売買は不可。
+価格1が24時間続いた会社は破産 (運営・ユーザー問わず):
+保有株は紙くず・会社データは消去・元オーナーは再設立可。
 """
 
 from __future__ import annotations
@@ -15,12 +24,21 @@ import math
 import random
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from services.database import DBService
 
 TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
 HISTORY_KEEP = 200
+
+# 会社設立の手数料 (消滅) と mu ボーナスの換算
+FOUNDING_FEE = 1000
+MU_BONUS_PER = 5000  # この投資額ごとに mu +0.001
+MU_BONUS_STEP = 0.001
+MU_BONUS_CAP = 0.003
+
+# 破産: 価格1がこの時間続いたら破産
+BANKRUPT_FLOOR_HOURS = 24
 
 # 1回の売買で需給により動く上限 (変動率)。自律変動 (sigma由来の
 # 数%〜十数%) より小さめにして、売買で暴落/暴騰しないようにする。
@@ -61,6 +79,7 @@ class Stock:
     sigma: float
     impact: float
     is_active: bool
+    owner_id: int | None = None  # None=運営銘柄、数値=ユーザー企業の設立者
 
 
 def normalize_ticker(raw: str) -> str:
@@ -81,10 +100,15 @@ def normalize_ticker(raw: str) -> str:
 
 
 def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
-    """幾何ランダムウォークで1歩進める。下限1。"""
+    """幾何ランダムウォークで1歩進める。下限1。
+
+    丸めは確率的 (stochastic rounding) にすることで期待値を保ちつつ、
+    価格1が吸着点にならないようにする (1でも毎tick数%の確率で2に脱出)。
+    """
     shock = rng.gauss(0.0, 1.0)
-    next_price = price * math.exp((mu - sigma * sigma / 2) + sigma * shock)
-    return max(1, round(next_price))
+    exact = price * math.exp((mu - sigma * sigma / 2) + sigma * shock)
+    stepped = math.floor(exact + rng.random())
+    return max(1, stepped)
 
 
 def _now() -> str:
@@ -92,6 +116,10 @@ def _now() -> str:
 
 
 def _row_to_stock(row) -> Stock:
+    try:
+        owner_id = row["owner_id"]
+    except (KeyError, IndexError):
+        owner_id = None
     return Stock(
         ticker=row["ticker"],
         display_name=row["display_name"],
@@ -100,6 +128,7 @@ def _row_to_stock(row) -> Stock:
         sigma=row["sigma"],
         impact=row["impact"],
         is_active=bool(row["is_active"]),
+        owner_id=int(owner_id) if owner_id is not None else None,
     )
 
 
@@ -136,6 +165,40 @@ async def get_history(ticker: str, limit: int = 100) -> list[tuple[str, int]]:
     return [(r["created_at"], r["price"]) for r in reversed(rows)]
 
 
+async def get_currency_index(limit: int = 100) -> list[tuple[str, float]]:
+    """通貨価値指数 (古い順)。tick毎のスナップショットから算出する。
+
+    指数 = (起点の平均株価 / 現在の平均株価)
+         × (起点の通貨総量 / 現在の通貨総量) × 100。
+    株安・通貨供給減で上がる (通貨高)。供給量が記録されていない
+    区間は株価成分のみで計算する。
+    """
+    limit = max(1, min(limit, HISTORY_KEEP))
+    cursor = await DBService.pool.execute(
+        "SELECT created_at, avg_price, total_supply FROM market_snapshots "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    await cursor.close()
+    snaps = [(r["created_at"], r["avg_price"], r["total_supply"]) for r in rows]
+    snaps.reverse()
+    if not snaps:
+        return []
+    base_avg, base_sup = snaps[0][1], snaps[0][2]
+    if not base_avg or base_avg <= 0:
+        return []
+    points: list[tuple[str, float]] = []
+    for created_at, avg_price, supply in snaps:
+        if not avg_price or avg_price <= 0:
+            continue
+        idx = base_avg / avg_price * 100
+        if base_sup > 0 and supply > 0:
+            idx *= base_sup / supply
+        points.append((created_at, idx))
+    return points
+
+
 async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
     """需給影響を即時反映。qty>0=買い(上昇)/qty<0=売り(下落)。
 
@@ -151,6 +214,9 @@ async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
         raise ValueError(f"{ticker} は存在しません")
     rate = dampen_impact_rate(stock.impact * qty)
     new_price = max(1, round(stock.price * (1 + rate)))
+    if rate != 0.0 and new_price == stock.price:
+        # 丸めで同値になる場合も最低1は動かす (価格1の吸着防止)。下限1。
+        new_price = max(1, stock.price + (1 if rate > 0 else -1))
     now = _now()
     await DBService.pool.execute(
         "UPDATE stocks SET price = ?, updated_at = ? WHERE ticker = ?",
@@ -161,7 +227,8 @@ async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
         (ticker, new_price, now),
     )
     await DBService.pool.commit()
-    return new_price, (new_price - stock.price) / stock.price
+    # 表示用は理論変動率を返す (価格1の最小1変動で+100%と表示されるのを避ける)
+    return new_price, rate
 
 
 def check_impact(impact: float) -> float:
@@ -184,21 +251,78 @@ def dampen_impact_rate(raw_rate: float) -> float:
     return raw_rate / (1.0 + abs(raw_rate) / MAX_TRADE_IMPACT)
 
 
-async def tick_once(rng: random.Random | None = None) -> list[Stock]:
-    """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。"""
+async def tick_once(
+    rng: random.Random | None = None,
+    now: datetime | None = None,
+) -> tuple[list[Stock], list[dict]]:
+    """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
+
+    価格1の滞在を追跡し、24時間続いた会社は破産させる (運営・ユーザー問わず)。
+    戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id}])。
+    """
     rng = rng or random.Random()
+    moment = now or datetime.now(UTC)
+    now_iso = moment.isoformat()
     stocks = await get_stocks(active_only=True)
-    now = _now()
     updated: list[Stock] = []
+    bankrupted: list[dict] = []
     for stock in stocks:
         new_price = step_price(stock.price, stock.mu, stock.sigma, rng)
+        if new_price <= 1:
+            cursor = await DBService.pool.execute(
+                "SELECT floor_since FROM stocks WHERE ticker = ?",
+                (stock.ticker,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            floor_since = None
+            if row is not None:
+                try:
+                    floor_since = row["floor_since"]
+                except (KeyError, IndexError):
+                    floor_since = None
+            if not floor_since:
+                await DBService.pool.execute(
+                    "UPDATE stocks SET price = 1, floor_since = ?, "
+                    "updated_at = ? WHERE ticker = ?",
+                    (now_iso, now_iso, stock.ticker),
+                )
+                await DBService.pool.execute(
+                    "INSERT INTO stock_history (ticker, price, created_at) "
+                    "VALUES (?, 1, ?)",
+                    (stock.ticker, now_iso),
+                )
+                stock.price = 1
+                updated.append(stock)
+                continue
+            try:
+                since = datetime.fromisoformat(floor_since)
+            except ValueError:
+                since = moment
+            if moment - since >= timedelta(hours=BANKRUPT_FLOOR_HOURS):
+                info = await go_bankrupt(stock.ticker)
+                bankrupted.append(info)
+                continue
+            await DBService.pool.execute(
+                "UPDATE stocks SET price = 1, updated_at = ? WHERE ticker = ?",
+                (now_iso, stock.ticker),
+            )
+            await DBService.pool.execute(
+                "INSERT INTO stock_history (ticker, price, created_at) "
+                "VALUES (?, 1, ?)",
+                (stock.ticker, now_iso),
+            )
+            stock.price = 1
+            updated.append(stock)
+            continue
         await DBService.pool.execute(
-            "UPDATE stocks SET price = ?, updated_at = ? WHERE ticker = ?",
-            (new_price, now, stock.ticker),
+            "UPDATE stocks SET price = ?, floor_since = NULL, updated_at = ? "
+            "WHERE ticker = ?",
+            (new_price, now_iso, stock.ticker),
         )
         await DBService.pool.execute(
             "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
-            (stock.ticker, new_price, now),
+            (stock.ticker, new_price, now_iso),
         )
         await DBService.pool.execute(
             "DELETE FROM stock_history WHERE ticker = ? AND id NOT IN "
@@ -208,8 +332,53 @@ async def tick_once(rng: random.Random | None = None) -> list[Stock]:
         )
         stock.price = new_price
         updated.append(stock)
+    # 通貨価値指数用のスナップショット (平均株価 + 通貨総量) を記録
+    cursor = await DBService.pool.execute(
+        "SELECT AVG(price) AS a FROM stocks WHERE is_active = 1"
+    )
+    avg_row = await cursor.fetchone()
+    await cursor.close()
+    cursor = await DBService.pool.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS s FROM users"
+    )
+    sup_row = await cursor.fetchone()
+    await cursor.close()
+    await DBService.pool.execute(
+        "INSERT INTO market_snapshots (created_at, avg_price, total_supply) "
+        "VALUES (?, ?, ?)",
+        (
+            now_iso,
+            avg_row["a"] if avg_row and avg_row["a"] else 0,
+            sup_row["s"] if sup_row else 0,
+        ),
+    )
+    await DBService.pool.execute(
+        "DELETE FROM market_snapshots WHERE id NOT IN "
+        "(SELECT id FROM market_snapshots ORDER BY id DESC LIMIT ?)",
+        (HISTORY_KEEP,),
+    )
     await DBService.pool.commit()
-    return updated
+    return updated, bankrupted
+
+
+async def go_bankrupt(ticker: str) -> dict:
+    """破産処理: 保有株は紙くず (無補償)・会社データを消去。
+
+    戻り値は {ticker, owner_id}。元オーナーは再設立できる。
+    """
+    ticker = normalize_ticker(ticker)
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    await DBService.pool.execute(
+        "DELETE FROM holdings WHERE ticker = ?", (ticker,)
+    )
+    await DBService.pool.execute(
+        "DELETE FROM stock_history WHERE ticker = ?", (ticker,)
+    )
+    await DBService.pool.execute("DELETE FROM stocks WHERE ticker = ?", (ticker,))
+    await DBService.pool.commit()
+    return {"ticker": ticker, "owner_id": stock.owner_id}
 
 
 async def add_ticker(
@@ -258,6 +427,110 @@ async def set_active(ticker: str, active: bool) -> Stock:
     )
     await DBService.pool.commit()
     stock.is_active = active
+    return stock
+
+
+async def set_active_own(user_id: int, ticker: str, active: bool) -> Stock:
+    """設立者用: 自分の会社のみ取扱停止/再開できる。"""
+    ticker = normalize_ticker(ticker)
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    if stock.owner_id != user_id:
+        raise ValueError(f"{ticker} はあなたの会社ではありません")
+    return await set_active(ticker, active)
+
+
+async def set_price(ticker: str, price: int) -> Stock:
+    """管理者用: 価格を直接設定 (価格1張り付き等の救済用)。履歴にも点を打つ。"""
+    ticker = normalize_ticker(ticker)
+    if price < 1:
+        raise ValueError("価格は1以上にしてください")
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    now = _now()
+    await DBService.pool.execute(
+        "UPDATE stocks SET price = ?, floor_since = NULL, updated_at = ? "
+        "WHERE ticker = ?",
+        (price, now, ticker),
+    )
+    await DBService.pool.execute(
+        "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
+        (ticker, price, now),
+    )
+    await DBService.pool.commit()
+    stock.price = price
+    return stock
+
+
+def founding_bonus_mu(invest: int) -> float:
+    """投資額に応じた mu ボーナス (+0.001/5000、上限+0.003)。"""
+    return min(max(invest, 0) // MU_BONUS_PER, 3) * MU_BONUS_STEP
+
+
+async def create_company(
+    user_id: int,
+    ticker: str,
+    invest: int,
+    mu: float = 0.0,
+    sigma: float = 0.05,
+    impact: float = 0.0005,
+) -> Stock:
+    """ユーザー用: 会社を設立 (1人1社)。設立手数料1000+投資金を徴収。
+
+    開始株価=投資金、mu=指定値+投資額ボーナス。戻り値は設立した銘柄。
+    残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
+    """
+    ticker = normalize_ticker(ticker)
+    if invest < 1:
+        raise ValueError("投資額は1以上にしてください")
+    if not -1.0 <= mu <= 1.0:
+        raise ValueError("muは-1.0〜1.0の範囲で指定してください")
+    if not 0.0 < sigma <= 1.0:
+        raise ValueError("sigmaは0より大きく1.0以下で指定してください")
+    check_impact(impact)
+    if await get_stock(ticker):
+        raise ValueError(f"{ticker} は既に存在します")
+    cursor = await DBService.pool.execute(
+        "SELECT 1 FROM stocks WHERE owner_id = ?", (user_id,)
+    )
+    own = await cursor.fetchone()
+    await cursor.close()
+    if own:
+        raise ValueError("会社は1人1社までです")
+    cost = FOUNDING_FEE + invest
+    cursor = await DBService.pool.execute(
+        "SELECT * FROM users WHERE id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row:
+        await DBService.pool.execute("INSERT INTO users(id) VALUES (?)", (user_id,))
+        await DBService.pool.commit()
+        balance = 100
+    else:
+        balance = row["amount"]
+    if balance < cost:
+        raise LookupError(f"残高不足: 必要 {cost}")
+    mu = min(mu + founding_bonus_mu(invest), 1.0)
+    now = _now()
+    await DBService.pool.execute(
+        "UPDATE users SET amount = amount - ? WHERE id = ?", (cost, user_id)
+    )
+    await DBService.pool.execute(
+        "INSERT INTO stocks "
+        "(ticker, display_name, price, mu, sigma, impact, is_active, "
+        "owner_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (ticker, ticker, invest, mu, sigma, impact, user_id, now),
+    )
+    await DBService.pool.execute(
+        "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
+        (ticker, invest, now),
+    )
+    await DBService.pool.commit()
+    stock = await get_stock(ticker)
+    assert stock is not None
     return stock
 
 
@@ -363,6 +636,8 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
         raise ValueError(f"{ticker} は存在しません")
     if not stock.is_active:
         raise ValueError(f"{ticker} は現在取扱停止中です")
+    if stock.owner_id is not None and stock.owner_id == user_id:
+        raise ValueError(f"{ticker} は自分の会社なので買えません")
 
     # ダミーMemberなしで残高を扱うため、money層と同じSQLで直接読む
     cursor = await DBService.pool.execute(
@@ -424,6 +699,8 @@ async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, floa
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
+    if stock.owner_id is not None and stock.owner_id == user_id:
+        raise ValueError(f"{ticker} は自分の会社なので売れません")
     cursor = await DBService.pool.execute(
         "SELECT * FROM holdings WHERE user_id = ? AND ticker = ?",
         (user_id, ticker),

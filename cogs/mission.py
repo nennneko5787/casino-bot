@@ -295,6 +295,16 @@ class MissionView(discord.ui.View):
         await interaction.response.defer()
         await self.refresh(interaction)
 
+    @discord.ui.button(label="閉じる", style=discord.ButtonStyle.danger, row=2)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.check_user(interaction):
+            return
+        await interaction.response.defer()
+        self.stop()
+        with suppress(Exception):
+            if interaction.message is not None:
+                await interaction.message.delete()
+
     async def on_timeout(self):
         for item in self.children:
             if isinstance(item, (discord.ui.Button, discord.ui.Select)):
