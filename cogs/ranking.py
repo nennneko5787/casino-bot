@@ -45,12 +45,12 @@ class RankingCog(commands.Cog):
     @commands.hybrid_command("ranking", brief="長者番付を表示します")
     @commands.guild_only()
     async def rankingCommand(self, ctx: commands.Context):
-        await ctx.reply(embed=await self._build(ctx, poor=False), ephemeral=True)
+        await ctx.reply(embed=await self._build(ctx, poor=False))
 
     @commands.hybrid_command("poor-ranking", brief="逆長者番付を表示します")
     @commands.guild_only()
     async def poorRankingCommand(self, ctx: commands.Context):
-        await ctx.reply(embed=await self._build(ctx, poor=True), ephemeral=True)
+        await ctx.reply(embed=await self._build(ctx, poor=True))
 
 
 async def setup(bot: commands.Bot):

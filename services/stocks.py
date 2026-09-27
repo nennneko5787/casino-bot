@@ -25,6 +25,19 @@ VOL_PRESETS: dict[str, float] = {
     "wild": 0.10,  # 荒い
 }
 
+# おまかせランダム用の値域
+RANDOM_MU_RANGE = (-0.002, 0.003)
+RANDOM_IMPACTS = (0.0002, 0.0003, 0.0005, 0.0008, 0.001, 0.002)
+
+
+def random_preset(rng: random.Random | None = None) -> tuple[float, float, float]:
+    """おまかせランダムの (mu, sigma, impact) を生成する。"""
+    rng = rng or random.Random()
+    mu = round(rng.uniform(*RANDOM_MU_RANGE), 6)
+    sigma = rng.choice(list(VOL_PRESETS.values()))
+    impact = rng.choice(RANDOM_IMPACTS)
+    return mu, sigma, impact
+
 
 @dataclass(kw_only=True, slots=True)
 class Stock:
@@ -38,11 +51,20 @@ class Stock:
 
 
 def normalize_ticker(raw: str) -> str:
-    """入力を ticker 形式に正規化。不正なら ValueError。"""
-    ticker = raw.strip().upper()
-    if not TICKER_RE.match(ticker):
-        raise ValueError("tickerは英数字1〜10文字で指定してください")
-    return ticker
+    """入力を ticker 形式に正規化。不正なら ValueError。
+
+    オートコンプリートの表示名 (例: "NEKO (800通貨) [取扱停止]") や
+    ポートフォリオ表示 (例: "`NEKO`") をコピペしても通るよう、
+    余分な文字が混ざっている場合は先頭の英数字トークンを抜き出す。
+    """
+    cleaned = raw.strip().upper().strip("`'\"")
+    if TICKER_RE.match(cleaned):
+        return cleaned
+    if re.search(r"[^A-Z0-9]", cleaned):
+        m = re.search(r"[A-Z0-9]{1,10}", cleaned)
+        if m:
+            return m.group(0)
+    raise ValueError("tickerは英数字1〜10文字で指定してください")
 
 
 def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
@@ -239,10 +261,15 @@ async def update_params(
 
 
 async def resolve_sigma(sigma: float | None, preset: str | None) -> float:
-    """簡単プリセットと数値指定の解決。preset優先、どちらも無ければ既定0.05。"""
+    """簡単プリセットと数値指定の解決。preset優先、どちらも無ければ既定0.05。
+
+    preset="random" の場合は3段階からランダムに選ぶ。
+    """
     if preset is not None:
+        if preset == "random":
+            return random.Random().choice(list(VOL_PRESETS.values()))
         if preset not in VOL_PRESETS:
-            raise ValueError("presetは calm/normal/wild から選んでください")
+            raise ValueError("presetは calm/normal/wild/random から選んでください")
         return VOL_PRESETS[preset]
     if sigma is not None:
         if not 0.0 < sigma <= 1.0:

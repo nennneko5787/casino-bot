@@ -253,7 +253,7 @@ class StockCog(commands.Cog):
         price="開始価格 (1以上)",
         mu="平均成長率 -1.0〜1.0 (省略時0)",
         sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
-        preset="指定するとsigmaの代わりに使われます",
+        preset="指定するとsigmaの代わりに使われます。おまかせランダムはmu/sigma/impactすべてランダム (個別指定は無視)",
         impact="需給感応度 0〜0.01/株 (省略時0.0005)",
     )
     @app_commands.choices(
@@ -261,6 +261,7 @@ class StockCog(commands.Cog):
             app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
             app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
             app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
         ]
     )
     async def stockAddCommand(
@@ -274,9 +275,12 @@ class StockCog(commands.Cog):
         impact: float = 0.0005,
     ):
         try:
-            resolved = await stocks.resolve_sigma(
-                sigma, preset.value if preset else None
-            )
+            if preset is not None and preset.value == "random":
+                mu, resolved, impact = stocks.random_preset()
+            else:
+                resolved = await stocks.resolve_sigma(
+                    sigma, preset.value if preset else None
+                )
             stock = await stocks.add_ticker(ticker, price, mu, resolved, impact)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
@@ -317,7 +321,20 @@ class StockCog(commands.Cog):
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma", impact="impact")
-    @app_commands.describe(mu="省略可", sigma="省略可", impact="省略可")
+    @app_commands.describe(
+        mu="省略可",
+        sigma="省略可",
+        impact="省略可",
+        preset="sigmaのプリセット。おまかせランダム可",
+    )
+    @app_commands.choices(
+        preset=[
+            app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
+            app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
+            app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ]
+    )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockParamsCommand(
         self,
@@ -326,14 +343,21 @@ class StockCog(commands.Cog):
         mu: float | None = None,
         sigma: float | None = None,
         impact: float | None = None,
+        preset: app_commands.Choice[str] | None = None,
     ):
-        if mu is None and sigma is None and impact is None:
+        if mu is None and sigma is None and impact is None and preset is None:
             await ctx.reply(
-                "mu・sigma・impactのいずれかを指定してください", ephemeral=True
+                "mu・sigma・impact・プリセットのいずれかを指定してください",
+                ephemeral=True,
             )
             return
         try:
-            stock = await stocks.update_params(ticker, mu, sigma, impact)
+            resolved_sigma = None
+            if preset is not None or sigma is not None:
+                resolved_sigma = await stocks.resolve_sigma(
+                    sigma, preset.value if preset else None
+                )
+            stock = await stocks.update_params(ticker, mu, resolved_sigma, impact)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
