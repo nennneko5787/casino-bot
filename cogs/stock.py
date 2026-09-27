@@ -22,6 +22,28 @@ CHART_NAME = "chart.png"
 TICK_INTERVAL_MINUTES = 5.0
 
 
+async def ticker_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """銘柄のオートコンプリート。存在チェック自体は各コマンド側で従来通り行う。"""
+    try:
+        items = await stocks.get_stocks(active_only=False)
+    except Exception:
+        logger.exception("銘柄候補の取得に失敗")
+        return []
+    current = current.strip().upper()
+    choices = [
+        app_commands.Choice(
+            name=f"{s.ticker} ({buildAmountText(s.price)})"
+            + ("" if s.is_active else " [取扱停止]"),
+            value=s.ticker,
+        )
+        for s in items
+        if current in s.ticker
+    ]
+    return choices[:25]
+
+
 class StockCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -77,6 +99,7 @@ class StockCog(commands.Cog):
     @stock.command(name="buy", brief="株を買います")
     @app_commands.rename(ticker="銘柄", qty="数量")
     @app_commands.describe(ticker="例: NEKO", qty="買う株数")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     @commands.guild_only()
     async def stockBuyCommand(self, ctx: commands.Context, ticker: str, qty: int = 1):
         if qty < 1:
@@ -105,6 +128,7 @@ class StockCog(commands.Cog):
     @stock.command(name="sell", brief="株を売ります")
     @app_commands.rename(ticker="銘柄", qty="数量")
     @app_commands.describe(ticker="例: NEKO", qty="売る株数")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     @commands.guild_only()
     async def stockSellCommand(self, ctx: commands.Context, ticker: str, qty: int = 1):
         if qty < 1:
@@ -131,6 +155,7 @@ class StockCog(commands.Cog):
     @stock.command(name="chart", brief="株価の折れ線チャートを表示します")
     @app_commands.rename(ticker="銘柄", count="件数")
     @app_commands.describe(ticker="例: NEKO", count="直近何件を描くか (最大200)")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     @commands.guild_only()
     async def stockChartCommand(
         self, ctx: commands.Context, ticker: str, count: int = 100
@@ -157,7 +182,7 @@ class StockCog(commands.Cog):
             color=discord.Color.blue(),
         )
         embed.set_image(url=f"attachment://{CHART_NAME}")
-        await ctx.reply(embed=embed, attachments=[file])
+        await ctx.reply(embed=embed, file=file)
 
     @stock.command(name="portfolio", brief="保有株と評価額を表示します")
     @commands.guild_only()
@@ -244,6 +269,7 @@ class StockCog(commands.Cog):
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockDelistCommand(self, ctx: commands.Context, ticker: str):
         try:
             stock = await stocks.set_active(ticker, False)
@@ -256,6 +282,7 @@ class StockCog(commands.Cog):
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockRelistCommand(self, ctx: commands.Context, ticker: str):
         try:
             stock = await stocks.set_active(ticker, True)
@@ -269,6 +296,7 @@ class StockCog(commands.Cog):
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma")
     @app_commands.describe(mu="省略可", sigma="省略可")
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockParamsCommand(
         self,
         ctx: commands.Context,
