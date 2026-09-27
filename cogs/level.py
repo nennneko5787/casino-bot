@@ -235,12 +235,18 @@ class LevelCog(commands.Cog):
         if gained <= 0:
             return
         try:
+            reward, repaid = await self._grant_reward_and_missions(
+                member.id, gained, old, new
+            )
             await self._grant_reward_and_missions(member.id, gained, old, new)
         except Exception:
             logger.exception("VC-XPの報酬記録に失敗")
             return
-        # VC退室時のレベルアップ通知は別チャンネルへの自動投稿になるため送らない。
-        # 報酬・ミッション記録のみ行い、通知は /level コマンドでの確認に任せる。
+        if new > old and member.guild is not None:
+            with suppress(Exception):
+                ch = self._notify_channel(member.guild)
+                if ch is not None:
+                    await _send_levelup(ch, member, old, new, gained, reward, repaid)
 
     @tasks.loop(minutes=5.0)
     async def vc_flush(self):
@@ -251,11 +257,26 @@ class LevelCog(commands.Cog):
             return
         for user_id, minutes, gained, old, new in results:
             try:
+                reward, repaid = await self._grant_reward_and_missions(
+                    user_id, gained, old, new
+                )
                 await self._grant_reward_and_missions(user_id, gained, old, new)
             except Exception:
                 logger.exception("VC-XPの報酬記録に失敗 user=%s", user_id)
                 continue
-            # 定期精算でのレベルアップ通知は別チャンネルへの自動投稿になるため送らない。
+            if new > old:
+                with suppress(Exception):
+                    for guild in self.bot.guilds:
+                        member = guild.get_member(user_id)
+                        if member is None:
+                            continue
+                        ch = self._notify_channel(guild)
+                        if ch is None:
+                            continue
+                        await _send_levelup(
+                            ch, member, old, new, gained, reward, repaid
+                        )
+                        break
 
     @vc_flush.before_loop
     async def _before_flush(self):
