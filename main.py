@@ -37,7 +37,7 @@ async def setup_hook():
     await bot.load_extension("cogs.loan")
     await bot.load_extension("cogs.mission")
     await bot.load_extension("cogs.level")
-    await bot.tree.sync()
+    await bot.load_extension("cogs.sync")
 
 
 @asynccontextmanager

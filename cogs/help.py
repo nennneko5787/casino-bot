@@ -237,6 +237,11 @@ def build_help_embeds() -> list[discord.Embed]:
         value="XPを付与する・レベル情報を初期化する",
         inline=False,
     )
+    admin.add_field(
+        name="c#sync ※プレフィックスのみ",
+        value="スラッシュコマンドを手動同期する (起動時は自動同期しない)",
+        inline=False,
+    )
     pages.append(admin)
 
     for i, embed in enumerate(pages):
