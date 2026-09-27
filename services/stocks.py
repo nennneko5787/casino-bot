@@ -3,6 +3,10 @@
 各銘柄は独立した乱数で更新されるため、同じように上がり下がりしない。
 mu/sigma は管理者が数値で直接指定できる (原案) ほか、
 簡単プリセット (おとなしい/ふつう/荒い) で sigma を決めることもできる。
+
+売買による需給影響は自律変動を主役にするため、逓減 + 上限付き。
+少量ならほぼ線形 (impact × 数量) に動くが、大量注文でも
+MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 """
 
 from __future__ import annotations
@@ -17,6 +21,10 @@ from services.database import DBService
 
 TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
 HISTORY_KEEP = 200
+
+# 1回の売買で需給により動く上限 (変動率)。自律変動 (sigma由来の
+# 数%〜十数%) より小さめにして、売買で暴落/暴騰しないようにする。
+MAX_TRADE_IMPACT = 0.03
 
 # 簡単プリセット: sigma の値のみ決める (mu は別途数値指定、省略時 0)
 VOL_PRESETS: dict[str, float] = {
@@ -131,13 +139,17 @@ async def get_history(ticker: str, limit: int = 100) -> list[tuple[str, int]]:
 async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
     """需給影響を即時反映。qty>0=買い(上昇)/qty<0=売り(下落)。
 
+    少量注文では impact × 数量どおりに動くが、大量注文は逓減させ、
+    MAX_TRADE_IMPACT (±3%) に漸近させる。自律変動 (tick) が主役で
+    売買では暴落/暴騰しないようにするための措置。
+
     戻り値は (新価格, 変動率)。履歴にも点を打つ。
     """
     ticker = normalize_ticker(ticker)
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
-    rate = stock.impact * qty
+    rate = dampen_impact_rate(stock.impact * qty)
     new_price = max(1, round(stock.price * (1 + rate)))
     now = _now()
     await DBService.pool.execute(
@@ -157,6 +169,19 @@ def check_impact(impact: float) -> float:
     if not 0.0 <= impact <= 0.01:
         raise ValueError("impactは0〜0.01の範囲で指定してください")
     return impact
+
+
+def dampen_impact_rate(raw_rate: float) -> float:
+    """線形インパクトを逓減させて上限内に収める。
+
+    raw_rate = impact × qty (符号付き) を
+    rate = raw / (1 + |raw| / MAX_TRADE_IMPACT) に変換する。
+    - 少量 (|raw| << 上限) ではほぼ raw のまま
+    - 大量では ±MAX_TRADE_IMPACT に漸近し、暴落/暴騰を防ぐ
+    """
+    if raw_rate == 0.0:
+        return 0.0
+    return raw_rate / (1.0 + abs(raw_rate) / MAX_TRADE_IMPACT)
 
 
 async def tick_once(rng: random.Random | None = None) -> list[Stock]:
