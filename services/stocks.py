@@ -25,18 +25,23 @@ VOL_PRESETS: dict[str, float] = {
     "wild": 0.10,  # 荒い
 }
 
+# mu のプリセット (平均成長率)
+MU_PRESETS: dict[str, float] = {
+    "down": -0.001,  # 下降トレンド
+    "flat": 0.0,  # 横ばい
+    "up": 0.001,  # 上昇トレンド
+}
+
+# impact のプリセット (1株あたりの変動率)
+IMPACT_PRESETS: dict[str, float] = {
+    "dull": 0.0002,  # 鈍感 (動きにくい)
+    "normal": 0.0005,  # ふつう
+    "sensitive": 0.001,  # 敏感 (動きやすい)
+}
+
 # おまかせランダム用の値域
 RANDOM_MU_RANGE = (-0.002, 0.003)
 RANDOM_IMPACTS = (0.0002, 0.0003, 0.0005, 0.0008, 0.001, 0.002)
-
-
-def random_preset(rng: random.Random | None = None) -> tuple[float, float, float]:
-    """おまかせランダムの (mu, sigma, impact) を生成する。"""
-    rng = rng or random.Random()
-    mu = round(rng.uniform(*RANDOM_MU_RANGE), 6)
-    sigma = rng.choice(list(VOL_PRESETS.values()))
-    impact = rng.choice(RANDOM_IMPACTS)
-    return mu, sigma, impact
 
 
 @dataclass(kw_only=True, slots=True)
@@ -276,6 +281,46 @@ async def resolve_sigma(sigma: float | None, preset: str | None) -> float:
             raise ValueError("sigmaは0より大きく1.0以下で指定してください")
         return sigma
     return VOL_PRESETS["normal"]
+
+
+def resolve_mu(
+    mu: float | None, mu_preset: str | None, rng: random.Random | None = None
+) -> float:
+    """mu の数値指定とプリセットの解決。プリセット優先、どちらも無ければ既定0。
+
+    mu_preset="random" の場合は -0.002〜+0.003 の一様乱数。
+    """
+    if mu_preset is not None:
+        if mu_preset == "random":
+            return round((rng or random.Random()).uniform(*RANDOM_MU_RANGE), 6)
+        if mu_preset not in MU_PRESETS:
+            raise ValueError("muのプリセットは down/flat/up/random から選んでください")
+        return MU_PRESETS[mu_preset]
+    if mu is not None:
+        if not -1.0 <= mu <= 1.0:
+            raise ValueError("muは-1.0〜1.0の範囲で指定してください")
+        return mu
+    return 0.0
+
+
+def resolve_impact(
+    impact: float | None, impact_preset: str | None, rng: random.Random | None = None
+) -> float:
+    """impact の数値指定とプリセットの解決。プリセット優先、どちらも無ければ既定。
+
+    impact_preset="random" の場合は候補値からランダムに選ぶ。
+    """
+    if impact_preset is not None:
+        if impact_preset == "random":
+            return (rng or random.Random()).choice(RANDOM_IMPACTS)
+        if impact_preset not in IMPACT_PRESETS:
+            raise ValueError(
+                "impactのプリセットは dull/normal/sensitive/random から選んでください"
+            )
+        return IMPACT_PRESETS[impact_preset]
+    if impact is not None:
+        return check_impact(impact)
+    return 0.0005
 
 
 async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:

@@ -247,14 +247,18 @@ class StockCog(commands.Cog):
         sigma="sigma",
         preset="プリセット",
         impact="impact",
+        mu_preset="muプリセット",
+        impact_preset="impactプリセット",
     )
     @app_commands.describe(
         ticker="英数字1〜10文字 (例: SONY)",
         price="開始価格 (1以上)",
         mu="平均成長率 -1.0〜1.0 (省略時0)",
         sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
-        preset="指定するとsigmaの代わりに使われます。おまかせランダムはmu/sigma/impactすべてランダム (個別指定は無視)",
+        preset="sigmaのプリセット。おまかせランダム可",
         impact="需給感応度 0〜0.01/株 (省略時0.0005)",
+        mu_preset="muのプリセット。おまかせランダム可",
+        impact_preset="impactのプリセット。おまかせランダム可",
     )
     @app_commands.choices(
         preset=[
@@ -262,26 +266,43 @@ class StockCog(commands.Cog):
             app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
             app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
             app_commands.Choice(name="おまかせランダム", value="random"),
-        ]
+        ],
+        mu_preset=[
+            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
+            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
+            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
+        impact_preset=[
+            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
+            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
+            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
     )
     async def stockAddCommand(
         self,
         ctx: commands.Context,
         ticker: str,
         price: int,
-        mu: float = 0.0,
+        mu: float | None = None,
         sigma: float | None = None,
         preset: app_commands.Choice[str] | None = None,
-        impact: float = 0.0005,
+        impact: float | None = None,
+        mu_preset: app_commands.Choice[str] | None = None,
+        impact_preset: app_commands.Choice[str] | None = None,
     ):
         try:
-            if preset is not None and preset.value == "random":
-                mu, resolved, impact = stocks.random_preset()
-            else:
-                resolved = await stocks.resolve_sigma(
-                    sigma, preset.value if preset else None
-                )
-            stock = await stocks.add_ticker(ticker, price, mu, resolved, impact)
+            mu_val = stocks.resolve_mu(mu, mu_preset.value if mu_preset else None)
+            sigma_val = await stocks.resolve_sigma(
+                sigma, preset.value if preset else None
+            )
+            impact_val = stocks.resolve_impact(
+                impact, impact_preset.value if impact_preset else None
+            )
+            stock = await stocks.add_ticker(
+                ticker, price, mu_val, sigma_val, impact_val
+            )
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
@@ -320,12 +341,21 @@ class StockCog(commands.Cog):
     @stockAdmin.command(name="params", brief="※管理者専用 mu/sigma/impactを変更します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
-    @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma", impact="impact")
+    @app_commands.rename(
+        ticker="銘柄",
+        mu="mu",
+        sigma="sigma",
+        impact="impact",
+        mu_preset="muプリセット",
+        impact_preset="impactプリセット",
+    )
     @app_commands.describe(
         mu="省略可",
         sigma="省略可",
         impact="省略可",
         preset="sigmaのプリセット。おまかせランダム可",
+        mu_preset="muのプリセット。おまかせランダム可",
+        impact_preset="impactのプリセット。おまかせランダム可",
     )
     @app_commands.choices(
         preset=[
@@ -333,7 +363,19 @@ class StockCog(commands.Cog):
             app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
             app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
             app_commands.Choice(name="おまかせランダム", value="random"),
-        ]
+        ],
+        mu_preset=[
+            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
+            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
+            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
+        impact_preset=[
+            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
+            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
+            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
+            app_commands.Choice(name="おまかせランダム", value="random"),
+        ],
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockParamsCommand(
@@ -344,20 +386,41 @@ class StockCog(commands.Cog):
         sigma: float | None = None,
         impact: float | None = None,
         preset: app_commands.Choice[str] | None = None,
+        mu_preset: app_commands.Choice[str] | None = None,
+        impact_preset: app_commands.Choice[str] | None = None,
     ):
-        if mu is None and sigma is None and impact is None and preset is None:
+        if (
+            mu is None
+            and sigma is None
+            and impact is None
+            and preset is None
+            and mu_preset is None
+            and impact_preset is None
+        ):
             await ctx.reply(
-                "mu・sigma・impact・プリセットのいずれかを指定してください",
+                "mu・sigma・impact・各プリセットのいずれかを指定してください",
                 ephemeral=True,
             )
             return
         try:
+            resolved_mu = None
+            if mu is not None or mu_preset is not None:
+                resolved_mu = stocks.resolve_mu(
+                    mu, mu_preset.value if mu_preset else None
+                )
             resolved_sigma = None
             if preset is not None or sigma is not None:
                 resolved_sigma = await stocks.resolve_sigma(
                     sigma, preset.value if preset else None
                 )
-            stock = await stocks.update_params(ticker, mu, resolved_sigma, impact)
+            resolved_impact = None
+            if impact is not None or impact_preset is not None:
+                resolved_impact = stocks.resolve_impact(
+                    impact, impact_preset.value if impact_preset else None
+                )
+            stock = await stocks.update_params(
+                ticker, resolved_mu, resolved_sigma, resolved_impact
+            )
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
