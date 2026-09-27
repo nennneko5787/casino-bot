@@ -38,6 +38,9 @@ class PaymentCog(commands.Cog):
     @app_commands.rename(amount="あげる額", to="対象")
     @app_commands.describe(amount="この額をあげます", to="ここで指定した人にあげます")
     async def sendCommand(self, ctx: commands.Context, amount: int, to: discord.Member):
+        if ctx.author.id == to.id:
+            raise YouMustDie()
+                
         userData = await getUser(to)
         toData = await getUser(to)
 
@@ -55,7 +58,7 @@ class PaymentCog(commands.Cog):
         await ctx.reply("送金しました", ephemeral=True)
 
         await ctx.channel.send(
-            f"{ctx.author.mention} から\n```patch\n{buildGetAmountText(-amount, md=True)}\n\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
+            f"{ctx.author.mention} から\n```patch\n{buildGetAmountText(-amount, md=True)}\n```\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
         )
 
 
