@@ -13,7 +13,8 @@ mu/sigma は管理者が数値で直接指定できる (原案) ほか、
 MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 
 ユーザーは会社を設立できる (1人1社、設立手数料1000+投資金、
-開始株価=投資金、muに投資額ボーナス)。自社株の売買は不可。
+開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定)。
+自社株の売買は不可。
 価格1が24時間続いた会社は破産 (運営・ユーザー問わず):
 保有株は紙くず・会社データは消去・元オーナーは再設立可。
 """
@@ -41,11 +42,8 @@ HISTORY_KEEP = 200
 SQLITE_MAX_INT = 9223372036854775807
 MAX_PRICE = 1_000_000_000_000  # 1兆。初期価格(数百〜数千)から十分に離しつつ安全域
 
-# 会社設立の手数料 (消滅) と mu ボーナスの換算
+# 会社設立の手数料 (消滅)。mu ボーナス等の優遇は下の INVEST_RANKS による。
 FOUNDING_FEE = 1000
-MU_BONUS_PER = 5000  # この投資額ごとに mu +0.001
-MU_BONUS_STEP = 0.001
-MU_BONUS_CAP = 0.003
 
 # 破産: 価格1がこの時間続いたら破産
 BANKRUPT_FLOOR_HOURS = 24
@@ -509,21 +507,47 @@ async def set_price(ticker: str, price: int) -> Stock:
 
 
 def founding_bonus_mu(invest: int) -> float:
-    """投資額に応じた mu ボーナス (+0.001/5000、上限+0.003)。"""
-    return min(max(invest, 0) // MU_BONUS_PER, 3) * MU_BONUS_STEP
+    """投資額に応じた mu ボーナス。ランク表が正本。"""
+    return rank_for_invest(invest).mu_bonus
+
+
+@dataclass(frozen=True, slots=True)
+class InvestRank:
+    """会社設立時の投資額ランク。投資が多いほど優遇される。"""
+
+    name: str
+    mu_bonus: float
+    sigma: float
+    impact: float
+
+
+# (下限, ランク)。上から順に判定する。
+INVEST_RANKS: list[tuple[int, InvestRank]] = [
+    (50000, InvestRank("S", 0.003, 0.03, 0.0003)),
+    (20000, InvestRank("A", 0.002, 0.05, 0.0005)),
+    (5000, InvestRank("B", 0.001, 0.07, 0.0008)),
+    (1, InvestRank("C", 0.0, 0.09, 0.001)),
+]
+
+
+def rank_for_invest(invest: int) -> InvestRank:
+    """投資額に対応するランクを返す。1未満は最低ランク。"""
+    for lower, rank in INVEST_RANKS:
+        if invest >= lower:
+            return rank
+    return INVEST_RANKS[-1][1]
 
 
 async def create_company(
     user_id: int,
     ticker: str,
     invest: int,
-    mu: float = 0.0,
-    sigma: float = 0.05,
-    impact: float = 0.0005,
 ) -> Stock:
     """ユーザー用: 会社を設立 (1人1社)。設立手数料1000+投資金を徴収。
 
-    開始株価=投資金、mu=指定値+投資額ボーナス。戻り値は設立した銘柄。
+    開始株価=投資金。mu/sigma/impactは投資額ランクで自動決定され、
+    指定はできない (管理者の add/params のみ数値・プリセット指定可)。
+    戻り値は設立した銘柄。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     """
     ticker = normalize_ticker(ticker)
@@ -531,11 +555,6 @@ async def create_company(
         raise ValueError("投資額は1以上にしてください")
     if invest > MAX_PRICE:
         raise ValueError(f"投資額は{MAX_PRICE:,}以下にしてください")
-    if not -1.0 <= mu <= 1.0:
-        raise ValueError("muは-1.0〜1.0の範囲で指定してください")
-    if not 0.0 < sigma <= 1.0:
-        raise ValueError("sigmaは0より大きく1.0以下で指定してください")
-    check_impact(impact)
     if await get_stock(ticker):
         raise ValueError(f"{ticker} は既に存在します")
     cursor = await DBService.pool.execute(
@@ -559,7 +578,10 @@ async def create_company(
         balance = row["amount"]
     if balance < cost:
         raise LookupError(f"残高不足: 必要 {cost}")
-    mu = min(mu + founding_bonus_mu(invest), 1.0)
+    rank = rank_for_invest(invest)
+    mu = min(rank.mu_bonus, 1.0)
+    sigma = rank.sigma
+    impact = rank.impact
     now = _now()
     await DBService.pool.execute(
         "UPDATE users SET amount = amount - ? WHERE id = ?", (cost, user_id)

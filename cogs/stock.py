@@ -4,7 +4,7 @@
 管理者: /stock-admin add|delist|relist|params|set-price
 
 会社は1人1社まで (設立手数料1000+投資金、開始株価=投資金、
-muに投資額ボーナス)。自社株の売買は不可。
+mu/sigma/impactは投資額ランクで自動決定)。自社株の売買は不可。
 価格1が24時間続いた会社は破産 (保有株は紙くず・会社消去)。
 """
 
@@ -367,45 +367,10 @@ class StockCog(commands.Cog):
         )
 
     @stock.command(name="create", brief="会社を設立します (1人1社)")
-    @app_commands.rename(
-        ticker="銘柄",
-        invest="投資額",
-        mu="mu",
-        sigma="sigma",
-        preset="プリセット",
-        impact="impact",
-        mu_preset="muプリセット",
-        impact_preset="impactプリセット",
-    )
+    @app_commands.rename(ticker="銘柄", invest="投資額")
     @app_commands.describe(
         ticker="英数字1〜10文字 (例: MYCO)",
-        invest="会社への投資額 (1以上)。開始株価になります",
-        mu="平均成長率 -1.0〜1.0 (省略時0)",
-        sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
-        preset="sigmaのプリセット。おまかせランダム可",
-        impact="需給感応度 0〜0.01/株 (省略時0.0005)",
-        mu_preset="muのプリセット。おまかせランダム可",
-        impact_preset="impactのプリセット。おまかせランダム可",
-    )
-    @app_commands.choices(
-        preset=[
-            app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
-            app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
-            app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        mu_preset=[
-            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
-            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
-            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        impact_preset=[
-            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
-            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
-            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
+        invest="会社への投資額 (1以上)。開始株価になり、額が多いほど好条件に",
     )
     @commands.guild_only()
     async def stockCreateCommand(
@@ -413,38 +378,24 @@ class StockCog(commands.Cog):
         ctx: commands.Context,
         ticker: str,
         invest: int,
-        mu: float | None = None,
-        sigma: float | None = None,
-        preset: app_commands.Choice[str] | None = None,
-        impact: float | None = None,
-        mu_preset: app_commands.Choice[str] | None = None,
-        impact_preset: app_commands.Choice[str] | None = None,
     ):
         try:
-            mu_val = stocks.resolve_mu(mu, mu_preset.value if mu_preset else None)
-            sigma_val = await stocks.resolve_sigma(
-                sigma, preset.value if preset else None
-            )
-            impact_val = stocks.resolve_impact(
-                impact, impact_preset.value if impact_preset else None
-            )
-            stock = await stocks.create_company(
-                ctx.author.id, ticker, invest, mu_val, sigma_val, impact_val
-            )
+            stock = await stocks.create_company(ctx.author.id, ticker, invest)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
         except LookupError:
             raise AmountNotEnough()
-        bonus = stocks.founding_bonus_mu(invest)
+        rank = stocks.rank_for_invest(invest)
         await ctx.reply(
             f"🏢 `{stock.ticker}` を設立しました！\n"
             f"設立費用: {buildAmountText(stocks.FOUNDING_FEE + invest)}"
             f" (手数料{buildAmountText(stocks.FOUNDING_FEE)}"
             f"＋投資{buildAmountText(invest)})\n"
             f"開始株価: {buildAmountText(stock.price)}"
-            f" (mu={stock.mu} sigma={stock.sigma} impact={stock.impact}"
-            f"・投資ボーナスmu+{bonus})\n"
+            f" (ランク{rank.name}: mu={stock.mu} sigma={stock.sigma}"
+            f" impact={stock.impact})\n"
+            "※投資額が多いほど好条件 (S: 5万〜 / A: 2万〜 / B: 5千〜 / C: 〜5千未満)\n"
             "※自分の会社の株は売買できません"
         )
 
