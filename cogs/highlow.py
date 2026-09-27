@@ -1,12 +1,14 @@
 """ハイアンドロー: 次のカードが HIGH か LOW かを予想し続けて倍率を積む。"""
 
 import random
+from contextlib import suppress
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services import missions
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
@@ -271,6 +273,9 @@ class HighLowResultView(discord.ui.View):
             "multiplier": 1.0,
             "history": [],
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(self.author_id, "game")
         await _origin(interaction).edit(
             embed=build_game_embed(self.author_id, self.bet, rank, suit, 1.0, []),
             view=HighLowView(self.cog, self.author_id),
@@ -311,6 +316,9 @@ class HighLowCog(commands.Cog):
             "multiplier": 1.0,
             "history": [],
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(ctx.author.id, "game")
         await ctx.reply(
             embed=build_game_embed(ctx.author.id, bet, rank, suit, 1.0, []),
             view=HighLowView(self, ctx.author.id),

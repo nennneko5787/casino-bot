@@ -6,13 +6,14 @@
 
 import asyncio
 import logging
+from contextlib import suppress
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from objects.exceptions import AmountNotEnough
-from services import stocks
+from services import missions, stocks
 from services.loan import repay_note
 from services.message import amountName, buildAmountText, buildGetAmountText
 from services.stock_chart import render_stock_chart
@@ -113,6 +114,10 @@ class StockCog(commands.Cog):
             return
         except LookupError:
             raise AmountNotEnough()
+        # ミッション: 株取引を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(ctx.author.id, "trade")
+            await missions.record_event(ctx.author.id, "trade_buy")
         await ctx.reply(
             embed=discord.Embed(
                 title="株を購入📈",
@@ -143,6 +148,9 @@ class StockCog(commands.Cog):
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
+        # ミッション: 株取引を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(ctx.author.id, "trade")
         await ctx.reply(
             embed=discord.Embed(
                 title="株を売却💰",

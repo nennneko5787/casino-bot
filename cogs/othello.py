@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, CasinoBaseException, YouMustDie
+from services import missions
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
@@ -768,6 +769,9 @@ class OthelloCog(commands.Cog):
             "mult": DIFFICULTY_MULT[difficulty],
             "player_first": player_first,
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(player_id, "game")
         await self.advance(
             message,
             self.games[gid],
@@ -791,6 +795,10 @@ class OthelloCog(commands.Cog):
             "bet": bet,
             "mode": "pvp",
         }
+        # ミッション: 両者のプレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(black_id, "game")
+            await missions.record_event(white_id, "game")
         await self.advance(message, self.games[gid], gid, notice="対戦開始！⚫からです")
 
     async def start_pvp(
@@ -1067,6 +1075,9 @@ class OthelloCog(commands.Cog):
             "mult": DIFFICULTY_MULT[diff],
             "player_first": first,
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(ctx.author.id, "game")
         await self.advance(
             msg,
             self.games[gid],

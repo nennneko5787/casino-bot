@@ -8,6 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services import missions
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
@@ -253,6 +254,9 @@ class BlackjackCog(commands.Cog):
             "dealer": dealer,
             "bet": bet,
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(author_id, "game")
         # 初手BJ判定
         result = None
         if is_blackjack(player) or is_blackjack(dealer):

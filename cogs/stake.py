@@ -1,12 +1,14 @@
 """situ_stake.py を Cog 化 + 通貨対応したダイス / マインズ。"""
 
 import random
+from contextlib import suppress
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services import missions
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
@@ -188,6 +190,10 @@ class DiceSetupView(discord.ui.View):
         await interaction.response.defer()
         user_data.amount -= bet
         result = play_dice(bet, target)
+
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(interaction.user.id, "game")
 
         if result["win"]:
             win_amount = int(bet * result["payout"])
@@ -680,6 +686,9 @@ class MinesSetupView(discord.ui.View):
             "bet": bet,
             "mines": num_mines,
         }
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(self.author_id, "game")
         embed = discord.Embed(
             title="マインズ",
             description=f"<@{self.author_id}>",

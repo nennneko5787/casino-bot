@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, EmojiNotFound, YouMustDie
+from services import missions
 from services.loan import apply_income, repay_note
 from services.message import buildGetAmountText
 from services.money import getUser
@@ -203,6 +204,10 @@ class SlotCog(commands.Cog):
             reward = -amount
 
         repaid, _ = await apply_income(user.id, reward)
+
+        # ミッション: プレー回数を記録 (失敗してもゲームは続行)
+        with suppress(Exception):
+            await missions.record_event(user.id, "game")
 
         if view is None:
             view = SlotRetryView(self, user.id, amount)

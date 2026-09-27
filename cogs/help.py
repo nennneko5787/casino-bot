@@ -23,7 +23,7 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     intro.add_field(
         name="カテゴリ",
-        value="🎰 カジノ / ⚫ オセロ / 📈 株 / 💰 お金・借金 / 🛠️ 管理者",
+        value="🎰 カジノ / ⚫ オセロ / 📈 株 / 💰 お金・借金 / 🎯 ミッション / 🛠️ 管理者",
         inline=False,
     )
     pages.append(intro)
@@ -141,6 +141,28 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     pages.append(money)
 
+    mission = discord.Embed(
+        title="🎯 ミッション",
+        description="発言・VC・ゲーム・株取引で通貨を稼げます。期限内に受け取らないと失効します (恒常は除く)。",
+        color=discord.Color.purple(),
+    )
+    mission.add_field(
+        name="/mission",
+        value="アワー/デイリー/ウィークリー/マンスリー/恒常の進捗確認・🎁ボタンで受取",
+        inline=False,
+    )
+    mission.add_field(
+        name="発言・VC",
+        value="チャット送信やVC滞在で進行。指定ch系は管理者設定のchのみ",
+        inline=False,
+    )
+    mission.add_field(
+        name="ゲーム・株",
+        value="カジノ・オセロ・株売買で進行。報酬は借金があれば自動返済に充当",
+        inline=False,
+    )
+    pages.append(mission)
+
     admin = discord.Embed(
         title="🛠️ 管理者専用",
         description="サーバー管理権限が必要です。",
@@ -164,6 +186,11 @@ def build_help_embeds() -> list[discord.Embed]:
     admin.add_field(
         name="/stock-admin params [銘柄]",
         value="mu / sigma / impact を変更する",
+        inline=False,
+    )
+    admin.add_field(
+        name="/mission-admin channel [ch] / unset-channel / status",
+        value="ミッションの指定chを設定・解除・確認する",
         inline=False,
     )
     pages.append(admin)
