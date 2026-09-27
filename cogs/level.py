@@ -6,6 +6,8 @@
 VC1分ごとに変動XP (8〜12)。レベル式は 5*Lv^2+50*Lv+100 の二次カーブ。
 """
 
+import asyncio
+import io
 import logging
 from contextlib import suppress
 from datetime import datetime
@@ -15,7 +17,12 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from services import levels, missions
-from services.levels import JST, RANKING_LIMIT
+from services.level_card import (
+    render_level_card,
+    render_level_ranking,
+    render_levelup_card,
+)
+from services.levels import JST, RANKING_LIMIT, REWARD_PER_LEVEL
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 
@@ -23,6 +30,45 @@ logger = logging.getLogger(__name__)
 
 BAR_WIDTH = 12
 MEDALS = ["🥇", "🥈", "🥉"]
+
+
+async def _avatar_bytes(member: discord.Member | discord.User) -> bytes | None:
+    try:
+        avatar = getattr(member, "display_avatar", None)
+        if isinstance(avatar, discord.Asset):
+            return await avatar.read()
+    except Exception:
+        logger.exception("アバター取得に失敗")
+    return None
+
+
+async def _send_levelup(
+    sendable,
+    member: discord.Member | discord.User,
+    old: int,
+    new: int,
+    gained: int,
+    reward: int,
+    repaid: int = 0,
+) -> None:
+    """レベルアップ通知を画像で送る。失敗時はEmbedにフォールバック。"""
+    mention = getattr(member, "mention", None) or str(member)
+    name = getattr(member, "display_name", str(member))
+    try:
+        av = await _avatar_bytes(member)
+        buf: io.BytesIO = await asyncio.to_thread(
+            render_levelup_card, name, old, new, gained, reward, av, repaid
+        )
+        await sendable.send(
+            content=f"{mention} レベルアップ！",
+            file=discord.File(buf, filename="levelup.png"),
+        )
+    except Exception:
+        logger.exception("レベルアップ画像の送信に失敗")
+        with suppress(Exception):
+            await sendable.send(
+                embed=build_levelup_embed(mention, old, new, gained, reward, repaid)
+            )
 
 
 def progress_bar(cur: int, need: int) -> str:
@@ -155,10 +201,8 @@ class LevelCog(commands.Cog):
             return
         if new > old:
             with suppress(Exception):
-                await message.channel.send(
-                    embed=build_levelup_embed(
-                        message.author.mention, old, new, gained, reward, repaid
-                    )
+                await _send_levelup(
+                    message.channel, message.author, old, new, gained, reward, repaid
                 )
 
     @commands.Cog.listener("on_voice_state_update")
@@ -200,11 +244,7 @@ class LevelCog(commands.Cog):
             with suppress(Exception):
                 ch = self._notify_channel(member.guild)
                 if ch is not None:
-                    await ch.send(
-                        embed=build_levelup_embed(
-                            member.mention, old, new, gained, reward, repaid
-                        )
-                    )
+                    await _send_levelup(ch, member, old, new, gained, reward, repaid)
 
     @tasks.loop(minutes=5.0)
     async def vc_flush(self):
@@ -230,10 +270,8 @@ class LevelCog(commands.Cog):
                         ch = self._notify_channel(guild)
                         if ch is None:
                             continue
-                        await ch.send(
-                            embed=build_levelup_embed(
-                                member.mention, old, new, gained, reward, repaid
-                            )
+                        await _send_levelup(
+                            ch, member, old, new, gained, reward, repaid
                         )
                         break
 
@@ -252,16 +290,23 @@ class LevelCog(commands.Cog):
     ):
         target = member or ctx.author
         info = await levels.get_info(target.id)
-        await ctx.reply(embed=build_level_embed(target, info))
+        name = getattr(target, "display_name", str(target))
+        try:
+            av = await _avatar_bytes(target)
+            buf = await asyncio.to_thread(
+                render_level_card, name, info, av, reward_per_level=REWARD_PER_LEVEL
+            )
+            await ctx.reply(file=discord.File(buf, filename="level.png"))
+        except Exception:
+            logger.exception("レベル画像の描画に失敗")
+            await ctx.reply(embed=build_level_embed(target, info))
 
     @commands.hybrid_command("level-ranking", brief="レベルランキングを表示します")
     @commands.guild_only()
     async def levelRankingCommand(self, ctx: commands.Context):
         rows = await levels.get_ranking(RANKING_LIMIT)
-        lines = []
-        for i, r in enumerate(rows):
-            rank = MEDALS[i] if i < len(MEDALS) else f"{i + 1}位"
-            name: str
+        cards: list[dict] = []
+        for r in rows:
             if ctx.guild:
                 m = ctx.guild.get_member(r["user_id"])
                 if m is not None:
@@ -274,19 +319,32 @@ class LevelCog(commands.Cog):
                         name = f"<@{r['user_id']}>"
             else:
                 name = f"<@{r['user_id']}>"
-            lines.append(f"{rank} {name}: Lv.{r['level']} (`{r['xp']}XP`)")
-        desc = "\n".join(lines) if lines else "対象者がいません"
-        embed = discord.Embed(
-            title=f"レベルランキング🏆 (TOP{RANKING_LIMIT})",
-            description=desc,
-            color=discord.Color.gold(),
-        )
-        embed.set_footer(
-            text=f"Lv式: 5*Lv^2+50*Lv+100 / チャット{levels.CHAT_MIN_XP}〜"
-            f"{levels.CHAT_MAX_XP}XP・VC1分{levels.VC_MIN_XP_PER_MIN}〜"
-            f"{levels.VC_MAX_XP_PER_MIN}XP"
-        )
-        await ctx.reply(embed=embed)
+            cards.append({"name": name, "level": r["level"], "xp": r["xp"]})
+        try:
+            buf = await asyncio.to_thread(
+                render_level_ranking, cards, limit=RANKING_LIMIT
+            )
+            await ctx.reply(file=discord.File(buf, filename="level_ranking.png"))
+        except Exception:
+            logger.exception("ランキング画像の描画に失敗")
+            lines = []
+            for i, r in enumerate(rows):
+                rank = MEDALS[i] if i < len(MEDALS) else f"{i + 1}位"
+                lines.append(
+                    f"{rank} {cards[i]['name']}: Lv.{r['level']} (`{r['xp']}XP`)"
+                )
+            desc = "\n".join(lines) if lines else "対象者がいません"
+            embed = discord.Embed(
+                title=f"レベルランキング🏆 (TOP{RANKING_LIMIT})",
+                description=desc,
+                color=discord.Color.gold(),
+            )
+            embed.set_footer(
+                text=f"Lv式: 5*Lv^2+50*Lv+100 / チャット{levels.CHAT_MIN_XP}〜"
+                f"{levels.CHAT_MAX_XP}XP・VC1分{levels.VC_MIN_XP_PER_MIN}〜"
+                f"{levels.VC_MAX_XP_PER_MIN}XP"
+            )
+            await ctx.reply(embed=embed)
 
     @commands.hybrid_group(
         name="level-admin", brief="※管理者専用 レベル情報を操作します"

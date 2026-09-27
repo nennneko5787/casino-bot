@@ -5,6 +5,8 @@
 発言・VC滞在はリスナーで自動記録、ゲーム回数は各Cogから記録する。
 """
 
+import asyncio
+import io
 import logging
 from contextlib import suppress
 from datetime import datetime
@@ -14,7 +16,12 @@ from discord.ext import commands, tasks
 
 from services import missions
 from services.loan import repay_note
-from services.message import buildAmountText, buildGetAmountText
+from services.message import (
+    amountName,
+    buildAmountText,
+    buildGetAmountText,
+)
+from services.mission_card import render_mission_page
 from services.missions import JST, PERIOD_LABEL, RESET_NOTE
 
 logger = logging.getLogger(__name__)
@@ -93,6 +100,39 @@ def build_mission_embeds(
     return embeds
 
 
+def _page_entries(status: list[dict], period: str) -> list[dict]:
+    return [
+        e
+        for e in status
+        if e["period"] == period
+        and not (e.get("hidden") and not e["completed"] and not e["claimed"])
+    ]
+
+
+def _render_page_image(
+    status: list[dict], channel_id: int | None, page: int
+) -> io.BytesIO:
+    period = PERIOD_ORDER[page]
+    channel_text = f"<#{channel_id}>" if channel_id else "未設定"
+    return render_mission_page(
+        period=period,
+        period_label=f"{PERIOD_LABEL[period]}",
+        reset_note=RESET_NOTE[period],
+        entries=_page_entries(status, period),
+        channel_text=channel_text,
+        page_idx=page,
+        total_pages=len(PERIOD_ORDER),
+        amount_name=amountName,
+    )
+
+
+async def _make_page_file(
+    status: list[dict], channel_id: int | None, page: int
+) -> discord.File:
+    buf = await asyncio.to_thread(_render_page_image, status, channel_id, page)
+    return discord.File(buf, filename=f"mission_{PERIOD_ORDER[page]}.png")
+
+
 class MissionClaimButton(discord.ui.Button):
     def __init__(self, mission_id: str, title: str):
         super().__init__(
@@ -133,13 +173,15 @@ class MissionPeriodSelect(discord.ui.Select):
 
 
 class MissionView(discord.ui.View):
-    """周期ページ送り + 受取ボタン。操作はコマンド実行者のみ。"""
+    """周期ページ送り + 受取ボタン。操作はコマンド実行者のみ。画像付き。"""
 
-    def __init__(self, author_id: int, embeds: list[discord.Embed], status: list[dict]):
+    def __init__(
+        self, author_id: int, status: list[dict], channel_id: int | None = None
+    ):
         super().__init__(timeout=180)
         self.author_id = author_id
-        self.embeds = embeds
         self.status = status
+        self.channel_id = channel_id
         self.page = 1  # デイリーを初期表示
         self.period_select = MissionPeriodSelect()
         self.add_item(self.period_select)
@@ -175,20 +217,30 @@ class MissionView(discord.ui.View):
 
     async def render(self, interaction: discord.Interaction):
         self._sync()
+        try:
+            file = await _make_page_file(self.status, self.channel_id, self.page)
+        except Exception:
+            logger.exception("ミッション画像の描画に失敗")
+            # フォールバック: Embed表示
+            embeds = build_mission_embeds(self.status, self.channel_id)
+            message = interaction.message
+            if message is not None:
+                await message.edit(embed=embeds[self.page], view=self)
+            else:
+                await interaction.response.edit_message(
+                    embed=embeds[self.page], view=self
+                )
+            return
         message = interaction.message
         if message is not None:
-            await message.edit(embed=self.embeds[self.page], view=self)
+            await message.edit(attachments=[file], view=self)
         else:
-            await interaction.response.edit_message(
-                embed=self.embeds[self.page], view=self
-            )
+            await interaction.response.edit_message(attachments=[file], view=self)
 
     async def refresh(self, interaction: discord.Interaction):
         try:
             self.status = await missions.get_status(self.author_id)
-            self.embeds = build_mission_embeds(
-                self.status, await missions.get_mission_channel()
-            )
+            self.channel_id = await missions.get_mission_channel()
         except Exception:
             logger.exception("ミッションの再読込に失敗")
             await interaction.followup.send(
@@ -225,7 +277,7 @@ class MissionView(discord.ui.View):
         if not await self.check_user(interaction):
             return
         await interaction.response.defer()
-        self.page = (self.page - 1) % len(self.embeds)
+        self.page = (self.page - 1) % len(PERIOD_ORDER)
         await self.render(interaction)
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.primary, row=2)
@@ -233,7 +285,7 @@ class MissionView(discord.ui.View):
         if not await self.check_user(interaction):
             return
         await interaction.response.defer()
-        self.page = (self.page + 1) % len(self.embeds)
+        self.page = (self.page + 1) % len(PERIOD_ORDER)
         await self.render(interaction)
 
     @discord.ui.button(label="更新", style=discord.ButtonStyle.secondary, row=2)
@@ -308,9 +360,16 @@ class MissionCog(commands.Cog):
     @commands.guild_only()
     async def missionCommand(self, ctx: commands.Context):
         status = await missions.get_status(ctx.author.id)
-        embeds = build_mission_embeds(status, await missions.get_mission_channel())
-        view = MissionView(ctx.author.id, embeds, status)
-        await ctx.reply(embed=embeds[view.page], view=view)
+        channel_id = await missions.get_mission_channel()
+        view = MissionView(ctx.author.id, status, channel_id)
+        try:
+            file = await _make_page_file(status, channel_id, view.page)
+        except Exception:
+            logger.exception("ミッション画像の描画に失敗")
+            embeds = build_mission_embeds(status, channel_id)
+            await ctx.reply(embed=embeds[view.page], view=view)
+            return
+        await ctx.reply(file=file, view=view)
 
     @commands.hybrid_group(
         name="mission-admin", brief="※管理者専用 ミッション設定をします"
