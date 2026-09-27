@@ -5,7 +5,8 @@
 - once は累積・無期限・1回限り。
 
 行動イベント: message(発言) / vc_minute(VC滞在・分) / game(カジノ・オセロ)
-  / trade(株売買) / trade_buy(株購入)。
+/ trade(株売買) / trade_buy(株購入) / xp(XP獲得量) / level(レベルアップ回数)
+/ sumanko(隠しキーワード発言)。
 ゲーム側Cog・on_message・on_voice_state_update から record_event() を呼ぶ。
 報酬は apply_income() 経由のため借金があれば自動返済に充当される。
 """
@@ -58,6 +59,7 @@ class MissionDef:
     title: str
     desc: str
     channel: str = CHANNEL_ANY
+    hidden: bool = False  # True: 達成するまで一覧に表示されない (隠しミッション)
 
 
 MISSIONS: list[MissionDef] = [
@@ -67,6 +69,7 @@ MISSIONS: list[MissionDef] = [
     MissionDef(
         "H3", "hourly", "game", 1, 30, "ゲームで1回遊ぶ", "スロット・BJなど何でも"
     ),
+    MissionDef("H4", "hourly", "xp", 40, 30, "XPを40稼ぐ", "チャット・VCで獲得"),
     # ---- デイリー ----
     MissionDef("D1", "daily", "message", 10, 100, "チャットで10通送る", "どこでもOK"),
     MissionDef(
@@ -82,6 +85,8 @@ MISSIONS: list[MissionDef] = [
     MissionDef("D3", "daily", "vc_minute", 30, 100, "VCに30分いる", "累積30分"),
     MissionDef("D4", "daily", "game", 3, 100, "ゲームで3回遊ぶ", "累積3プレイ"),
     MissionDef("D5", "daily", "trade", 1, 100, "株を1回取引する", "売買どちらでも"),
+    MissionDef("D6", "daily", "xp", 150, 100, "XPを150稼ぐ", "チャット・VCで獲得"),
+    MissionDef("D7", "daily", "level", 1, 150, "レベルアップする", "1回レベルアップ"),
     # ---- ウィークリー ----
     MissionDef("W1", "weekly", "message", 50, 400, "チャットで50通送る", "どこでもOK"),
     MissionDef(
@@ -96,18 +101,39 @@ MISSIONS: list[MissionDef] = [
     ),
     MissionDef("W3", "weekly", "vc_minute", 180, 400, "VCに3時間いる", "累積180分"),
     MissionDef("W4", "weekly", "game", 10, 400, "ゲームで10回遊ぶ", "累積10プレイ"),
+    MissionDef("W5", "weekly", "xp", 800, 400, "XPを800稼ぐ", "チャット・VCで獲得"),
+    MissionDef("W6", "weekly", "level", 2, 500, "2回レベルアップする", "累積2回"),
     # ---- マンスリー ----
     MissionDef(
         "M1", "monthly", "message", 200, 1500, "チャットで200通送る", "どこでもOK"
     ),
     MissionDef("M2", "monthly", "vc_minute", 600, 1500, "VCに10時間いる", "累積600分"),
     MissionDef("M3", "monthly", "game", 30, 1000, "ゲームで30回遊ぶ", "累積30プレイ"),
+    MissionDef("M4", "monthly", "xp", 3000, 1500, "XPを3000稼ぐ", "チャット・VCで獲得"),
+    MissionDef("M5", "monthly", "level", 5, 1500, "5回レベルアップする", "累積5回"),
     # ---- 恒常 ----
     MissionDef("P1", "once", "game", 1, 100, "初めてゲームで遊ぶ", "何でも1プレイ"),
     MissionDef("P2", "once", "trade_buy", 1, 200, "初めて株を買う", "購入1回"),
     MissionDef("P3", "once", "message", 100, 500, "累計100通送る", "どこでもOK"),
     MissionDef("P4", "once", "vc_minute", 300, 500, "累計VC5時間", "累計300分"),
     MissionDef("P5", "once", "game", 50, 1000, "累計50回遊ぶ", "累計50プレイ"),
+    MissionDef("P6", "once", "xp", 5000, 800, "累計XP5000稼ぐ", "チャット・VCで獲得"),
+    MissionDef(
+        "P7", "once", "xp", 20000, 2000, "累計XP20000稼ぐ", "チャット・VCで獲得"
+    ),
+    MissionDef("P8", "once", "level", 3, 500, "3回レベルアップする", "累計3回"),
+    MissionDef("P9", "once", "level", 10, 1500, "10回レベルアップする", "累計10回"),
+    # ---- 隠し (達成まで非表示) ----
+    MissionDef(
+        "S1",
+        "once",
+        "sumanko",
+        1,
+        500,
+        "すまんこと送る",
+        "隠しミッション発見！",
+        hidden=True,
+    ),
 ]
 
 BY_ID: dict[str, MissionDef] = {m.id: m for m in MISSIONS}
@@ -276,6 +302,7 @@ async def get_status(user_id: int) -> list[dict]:
                 "title": m.title,
                 "desc": m.desc,
                 "channel": m.channel,
+                "hidden": m.hidden,
                 "channel_id": channel if m.channel == CHANNEL_CONFIG else None,
                 "available": m.channel != CHANNEL_CONFIG or channel is not None,
                 "period_key": key,

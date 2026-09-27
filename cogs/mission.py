@@ -46,18 +46,29 @@ def progress_bar(progress: int, target: int) -> str:
 def build_mission_embeds(
     status: list[dict], channel_id: int | None
 ) -> list[discord.Embed]:
-    """周期ごとのEmbedを PERIOD_ORDER 順で返す。"""
+    """周期ごとのEmbedを PERIOD_ORDER 順で返す。
+
+    hiddenミッションは達成 (または受取済み) になるまで一覧に出さない。
+    """
     channel_text = f"<#{channel_id}>" if channel_id else "未設定"
     embeds: list[discord.Embed] = []
     for period in PERIOD_ORDER:
-        entries = [e for e in status if e["period"] == period]
+        entries = [
+            e
+            for e in status
+            if e["period"] == period
+            and not (e.get("hidden") and not e["completed"] and not e["claimed"])
+        ]
+        description = (
+            f"{RESET_NOTE[period]}\n"
+            "期限内に受け取らないと報酬は失効します (恒常は除く)\n"
+            f"指定ch: {channel_text}"
+        )
+        if period == "once":
+            description += "\n❓隠しミッションもあるかも…？"
         embed = discord.Embed(
             title=f"{PERIOD_EMOJI[period]} {PERIOD_LABEL[period]}ミッション",
-            description=(
-                f"{RESET_NOTE[period]}\n"
-                "期限内に受け取らないと報酬は失効します (恒常は除く)\n"
-                f"指定ch: {channel_text}"
-            ),
+            description=description,
             color=PERIOD_COLOR[period],
         )
         for e in entries:
@@ -268,6 +279,10 @@ class MissionCog(commands.Cog):
             await missions.record_event(
                 message.author.id, "message", 1, channel_id=message.channel.id
             )
+        # 隠しミッション: 「すまんこ」と一言送る (前後の空白は無視)
+        if message.content.strip() == "すまんこ":
+            with suppress(Exception):
+                await missions.record_event(message.author.id, "sumanko", 1)
 
     @commands.Cog.listener("on_voice_state_update")
     async def onMissionVoice(

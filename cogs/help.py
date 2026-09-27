@@ -23,7 +23,7 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     intro.add_field(
         name="カテゴリ",
-        value="🎰 カジノ / ⚫ オセロ / 📈 株 / 💰 お金・借金 / 🎯 ミッション / 🛠️ 管理者",
+        value="🎰 カジノ / ⚫ オセロ / 📈 株 / 💰 お金・借金 / 🎯 ミッション / 🆙 レベル / 🛠️ 管理者",
         inline=False,
     )
     pages.append(intro)
@@ -161,7 +161,46 @@ def build_help_embeds() -> list[discord.Embed]:
         value="カジノ・オセロ・株売買で進行。報酬は借金があれば自動返済に充当",
         inline=False,
     )
+    mission.add_field(
+        name="レベル系",
+        value="XP獲得 (H4/D6/W5/M4/P6/P7)・レベルアップ (D7/W6/M5/P8/P9) でも進行",
+        inline=False,
+    )
+    mission.add_field(
+        name="❓隠しミッション",
+        value="達成するまで一覧に表示されません。探してみよう！",
+        inline=False,
+    )
     pages.append(mission)
+
+    level = discord.Embed(
+        title="🆙 レベル",
+        description=(
+            "チャット・VC滞在でXPを稼ぎ、レベルアップで通貨報酬がもらえます "
+            "(報酬は借金があれば自動返済に充当)。"
+        ),
+        color=discord.Color.blurple(),
+    )
+    level.add_field(
+        name="/level [対象]",
+        value="レベル・XP・進捗・発言数・VC時間・順位を表示 (省略時は自分)",
+        inline=False,
+    )
+    level.add_field(
+        name="/level-ranking",
+        value="XP上位10名のレベル番付を表示",
+        inline=False,
+    )
+    level.add_field(
+        name="XPの稼ぎ方",
+        value=(
+            "チャット1通: 15〜25+長文ボーナス (60秒CD、短文・連投は半減)\n"
+            "VC1分: 8〜12 (5分ごとに自動加算)\n"
+            "必要XP: 5*Lv^2+50*Lv+100 / 報酬: 到達Lv×50"
+        ),
+        inline=False,
+    )
+    pages.append(level)
 
     admin = discord.Embed(
         title="🛠️ 管理者専用",
@@ -191,6 +230,11 @@ def build_help_embeds() -> list[discord.Embed]:
     admin.add_field(
         name="/mission-admin channel [ch] / unset-channel / status",
         value="ミッションの指定chを設定・解除・確認する",
+        inline=False,
+    )
+    admin.add_field(
+        name="/level-admin add [対象] [XP量] / reset [対象]",
+        value="XPを付与する・レベル情報を初期化する",
         inline=False,
     )
     pages.append(admin)

@@ -1,14 +1,19 @@
+import logging
+
 import discord
 import dotenv
 from discord import app_commands
 from discord.ext import commands
 
+from services.levels import get_info as get_level_info
 from services.loan import get_debt
 from services.message import buildAmountText
 from services.money import getUser
 from services.stocks import get_portfolio
 
 dotenv.load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class StatsCog(commands.Cog):
@@ -35,6 +40,11 @@ class StatsCog(commands.Cog):
         lines.append(
             f"総資産: `{buildAmountText(userData.amount + stock_value - debt)}`"
         )
+        try:
+            lv = await get_level_info(target.id)
+            lines.append(f"レベル: `Lv.{lv['level']} ({lv['xp']}XP)`")
+        except Exception:
+            logger.exception("レベル情報の取得に失敗")
         await ctx.reply(
             embed=discord.Embed(description="\n".join(lines)).set_author(
                 name=target.display_name, icon_url=target.display_avatar
