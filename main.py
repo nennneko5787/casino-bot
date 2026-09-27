@@ -16,7 +16,7 @@ dotenv.load_dotenv()
 
 
 intents = discord.Intents.all()
-bot = commands.Bot("c#", intents=intents)
+bot = commands.Bot("c#", intents=intents, help_command=None)
 
 discord.utils.setup_logging()
 
@@ -24,6 +24,7 @@ discord.utils.setup_logging()
 @bot.event
 async def setup_hook():
     await bot.load_extension("cogs.error")
+    await bot.load_extension("cogs.help")
     await bot.load_extension("cogs.slot")
     await bot.load_extension("cogs.stake")
     await bot.load_extension("cogs.highlow")
