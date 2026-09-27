@@ -7,8 +7,10 @@ VC1分ごとに変動XP (8〜12)。レベル式は 5*Lv^2+50*Lv+100 の二次カ
 """
 
 import asyncio
+import dotenv
 import io
 import logging
+import os
 from contextlib import suppress
 from datetime import datetime
 
@@ -27,10 +29,14 @@ from services.levels import JST, RANKING_LIMIT, REWARD_PER_LEVEL
 from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 
+dotenv.load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 BAR_WIDTH = 12
 MEDALS = ["🥇", "🥈", "🥉"]
+
+logChannel = os.environ["log_channel"]
 
 
 async def _avatar_bytes(member: discord.Member | discord.User) -> bytes | None:
@@ -168,17 +174,9 @@ class LevelCog(commands.Cog):
     def _notify_channel(
         self, guild: discord.Guild | None
     ) -> discord.TextChannel | None:
-        # ※ VC由来のレベルアップを別チャンネルへ自動投稿しない方針のため、
-        # 現在は未使用 (チャット由来は発言チャンネルへ返す)。互換のため残す。
         if guild is None:
             return None
-        ch = guild.system_channel
-        if ch is not None and ch.permissions_for(guild.me).send_messages:
-            return ch
-        for c in guild.text_channels:
-            if c.permissions_for(guild.me).send_messages:
-                return c
-        return None
+        return guild.get_channel(logChannel)
 
     # ---------- リスナー ----------
 
@@ -205,7 +203,7 @@ class LevelCog(commands.Cog):
         if new > old:
             with suppress(Exception):
                 await _send_levelup(
-                    message.channel, message.author, old, new, gained, reward, repaid
+                    message.guild.get_channel(logChannel), message.author, old, new, gained, reward, repaid
                 )
 
     @commands.Cog.listener("on_voice_state_update")
