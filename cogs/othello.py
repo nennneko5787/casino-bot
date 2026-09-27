@@ -16,6 +16,7 @@ from discord.ext import commands
 from objects.exceptions import AmountNotEnough, CasinoBaseException, YouMustDie
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
+from services.othello_image import render_board_image
 
 dotenv.load_dotenv()
 
@@ -45,6 +46,7 @@ COL_FW = "ＡＢＣＤＥＦＧＨ"
 ROW_FW = "１２３４５６７８"
 REGIONAL_BASE = 0x1F1E6  # 🇦
 MOVES_PER_PAGE = 20  # ボタン4行分。残り1行はページ送り/降参用
+BOARD_IMAGE_NAME = "othello.png"  # Embed側は attachment://othello.png で参照
 
 
 def move_letter(i: int) -> str:
@@ -384,14 +386,16 @@ class OthelloGameView(discord.ui.View):
         message = interaction.message
         assert message is not None
         view.message = message
+        hints = self.cog.hint_markers(game, self.cog.tiles)
         await message.edit(
             embed=self.cog.build_game_embed(
                 game,
-                self.cog.hint_markers(game, self.cog.tiles),
+                hints,
                 self.notice,
                 view.page,
                 view.page_count,
             ),
+            attachments=[self.cog.board_file(game, hints)],
             view=view,
         )
 
@@ -815,6 +819,12 @@ class OthelloCog(commands.Cog):
             markers[(r, c)] = letters[i] if i < len(letters) else "🟨"
         return markers
 
+    @staticmethod
+    def board_file(game: dict, hints: dict | None = None) -> discord.File:
+        """盤面を1枚画像化した discord.File。Embedは attachment://othello.png を参照。"""
+        buf = render_board_image(game["board"], hints or {})
+        return discord.File(buf, filename=BOARD_IMAGE_NAME)
+
     def build_game_embed(
         self, game: dict, hints: dict, notice: str = "", page: int = 0, pages: int = 1
     ) -> discord.Embed:
@@ -834,7 +844,6 @@ class OthelloCog(commands.Cog):
         desc = f"{desc_head}\n手番: {turn_text} {color_emoji(game['turn'])}"
         if notice:
             desc += f"\n{notice}"
-        desc += "\n" + render_board(game["board"], self.tiles, hints)
         embed = discord.Embed(
             title=title, description=desc, color=discord.Color.random()
         )
@@ -847,6 +856,7 @@ class OthelloCog(commands.Cog):
         if any(v == "🟨" for v in hints.values()):
             footer += " 🟨は座標ボタンで指定。"
         embed.set_footer(text=footer)
+        embed.set_image(url=f"attachment://{BOARD_IMAGE_NAME}")
         return embed
 
     async def advance(
@@ -886,14 +896,16 @@ class OthelloCog(commands.Cog):
                 continue
             view = OthelloGameView(self, gid, notice=notice)
             view.message = message
+            hints = self.hint_markers(game, self.tiles)
             await message.edit(
                 embed=self.build_game_embed(
                     game,
-                    self.hint_markers(game, self.tiles),
+                    hints,
                     notice,
                     view.page,
                     view.page_count,
                 ),
+                attachments=[self.board_file(game, hints)],
                 view=view,
             )
             return
@@ -998,14 +1010,18 @@ class OthelloCog(commands.Cog):
         embed = discord.Embed(
             title="オセロ [対局終了]",
             description=(
-                f"⚫<@{game['black_id']}> vs ⚪<@{game['white_id']}>\n"
-                f"{desc_extra}\n" + render_board(game["board"], self.tiles)
+                f"⚫<@{game['black_id']}> vs ⚪<@{game['white_id']}>\n{desc_extra}"
             ),
             color=color,
         )
         embed.add_field(name="⚫ / ⚪", value=f"{black_n} / {white_n}")
         embed.add_field(name="掛け金 (1人あたり)", value=buildAmountText(bet))
-        await message.edit(embed=embed, view=view)
+        embed.set_image(url=f"attachment://{BOARD_IMAGE_NAME}")
+        await message.edit(
+            embed=embed,
+            attachments=[self.board_file(game)],
+            view=view,
+        )
 
     # ----- コマンド -----
 
