@@ -13,13 +13,13 @@ from discord.ext import commands, tasks
 
 from objects.exceptions import AmountNotEnough
 from services import stocks
-from services.message import buildAmountText, buildGetAmountText
+from services.message import amountName, buildAmountText, buildGetAmountText
 from services.stock_chart import render_stock_chart
 
 logger = logging.getLogger(__name__)
 
 CHART_NAME = "chart.png"
-TICK_INTERVAL_MINUTES = 5.0
+TICK_INTERVAL_MINUTES = 1.0
 
 
 async def ticker_autocomplete(
@@ -170,7 +170,7 @@ class StockCog(commands.Cog):
             await ctx.reply(f"{name} は存在しません", ephemeral=True)
             return
         history = await stocks.get_history(name, count)
-        buf = await asyncio.to_thread(render_stock_chart, history, name)
+        buf = await asyncio.to_thread(render_stock_chart, history, name, amountName)
         file = discord.File(buf, filename=CHART_NAME)
         embed = discord.Embed(
             title=f"{name} チャート📈",
@@ -196,11 +196,20 @@ class StockCog(commands.Cog):
         for item in items:
             total_profit += item["profit"]
             status = "" if item["is_active"] else " [停止]"
+            if item["profit"] > 0:
+                profit_text = f"損益+{buildAmountText(item['profit'])}"
+            elif item["profit"] < 0:
+                profit_text = f"損益-{buildAmountText(-item['profit'])}"
+            else:
+                profit_text = "損益±0"
+            if item["avg_cost"] > 0:
+                rate = (item["price"] - item["avg_cost"]) / item["avg_cost"] * 100
+                profit_text += f" ({rate:+.1f}%)"
             lines.append(
                 f"`{item['ticker']}`{status}: {item['qty']}株 "
                 f"(平均{buildAmountText(item['avg_cost'])} → "
                 f"現在{buildAmountText(item['price'])}) "
-                f"評価{buildAmountText(item['market'])}"
+                f"評価{buildAmountText(item['market'])} {profit_text}"
             )
         await ctx.reply(
             embed=discord.Embed(
