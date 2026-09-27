@@ -1,11 +1,15 @@
-"""借金: /loan borrow|repay|status。入金は自動で返済に充当される。"""
+"""借金: /loan borrow|repay|status。入金は自動で返済に充当される。
+
+借金残高には1000ごとのウォールがあり、壁到達で次の1000が解放される。
+手数料は残債1000までの分が10%、1000超の分が20%。
+"""
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from services import loan
-from services.loan import FEE_RATE, MAX_DEBT
+from services.loan import FEE_RATE, OVER_FEE_RATE, WALL_STEP, debt_wall
 from services.message import buildAmountText, buildGetAmountText
 
 
@@ -21,9 +25,11 @@ class LoanCog(commands.Cog):
             ephemeral=True,
         )
 
-    @loan.command(name="borrow", brief="お金を借ります (手数料10%)")
+    @loan.command(name="borrow", brief="お金を借ります (手数料10%・1000超は20%)")
     @app_commands.rename(amount="借りる額")
-    @app_commands.describe(amount=f"1〜{MAX_DEBT}。借金残高の上限も{MAX_DEBT}です")
+    @app_commands.describe(
+        amount=f"1以上。借金残高のウォール({WALL_STEP}ごと)まで借りられます"
+    )
     @commands.guild_only()
     async def loanBorrowCommand(self, ctx: commands.Context, amount: int):
         try:
@@ -32,14 +38,20 @@ class LoanCog(commands.Cog):
             await ctx.reply(str(e), ephemeral=True)
             return
         debt = await loan.get_debt(ctx.author.id)
+        wall = debt_wall(debt)
+        fee_note = (
+            f"(手数料: 残債{WALL_STEP}までの分{int(FEE_RATE * 100)}%"
+            f"・超過分{int(OVER_FEE_RATE * 100)}%: 借金+{buildAmountText(debt_add)})\n"
+        )
         await ctx.reply(
             embed=discord.Embed(
                 title="借金💸",
                 description=(
                     f"<@{ctx.author.id}>\n"
                     f"{buildAmountText(received)}を借りました\n"
-                    f"(手数料{int(FEE_RATE * 100)}%: 借金+{buildAmountText(debt_add)})\n"
-                    f"現在の借金残高: {buildAmountText(debt)}\n"
+                    f"{fee_note}"
+                    f"現在の借金残高: {buildAmountText(debt)}"
+                    f" (ウォール: {buildAmountText(wall)})\n"
                     "※入金があると自動で返済に充当されます"
                 ),
                 color=discord.Color.red(),
@@ -75,6 +87,7 @@ class LoanCog(commands.Cog):
     async def loanStatusCommand(self, ctx: commands.Context):
         debt = await loan.get_debt(ctx.author.id)
         rest = await loan.borrowable(ctx.author.id)
+        wall = debt_wall(debt)
         await ctx.reply(
             embed=discord.Embed(
                 title="借金状況💸",
@@ -82,7 +95,9 @@ class LoanCog(commands.Cog):
                     f"<@{ctx.author.id}>\n"
                     f"借金残高: {buildAmountText(debt)}\n"
                     f"あと借りられる額: {buildAmountText(rest)}\n"
-                    f"(上限{buildAmountText(MAX_DEBT)}・手数料{int(FEE_RATE * 100)}%)"
+                    f"(現在のウォール: {buildAmountText(wall)}"
+                    f"・手数料{int(FEE_RATE * 100)}%"
+                    f"/{WALL_STEP}超は{int(OVER_FEE_RATE * 100)}%)"
                 ),
                 color=discord.Color.orange(),
             ),
