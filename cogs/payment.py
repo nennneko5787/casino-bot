@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildGetAmountText
 from services.money import getUser, saveUser
 
@@ -22,15 +23,13 @@ class PaymentCog(commands.Cog):
     @app_commands.rename(amount="あげる額", to="対象")
     @app_commands.describe(amount="この額をあげます", to="ここで指定した人にあげます")
     async def giveCommand(self, ctx: commands.Context, amount: int, to: discord.Member):
-        userData = await getUser(to)
-
-        userData.amount += amount
-        await saveUser(userData)
+        repaid, _ = await apply_income(to.id, amount)
 
         await ctx.reply("送金しました", ephemeral=True)
 
         await ctx.channel.send(
             f"{ctx.author.mention} から\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
+            + repay_note(repaid)
         )
 
     @commands.hybrid_command("send", brief="他のメンバーに所持金を譲渡します")
@@ -40,9 +39,8 @@ class PaymentCog(commands.Cog):
     async def sendCommand(self, ctx: commands.Context, amount: int, to: discord.Member):
         if ctx.author.id == to.id:
             raise YouMustDie()
-                
-        userData = await getUser(to)
-        toData = await getUser(to)
+
+        userData = await getUser(ctx.author)
 
         if amount < 0:
             raise YouMustDie()
@@ -50,15 +48,14 @@ class PaymentCog(commands.Cog):
             raise AmountNotEnough()
 
         userData.amount -= amount
-        toData.amount += amount
-
         await saveUser(userData)
-        await saveUser(toData)
+        repaid, _ = await apply_income(to.id, amount)
 
         await ctx.reply("送金しました", ephemeral=True)
 
         await ctx.channel.send(
             f"{ctx.author.mention} から\n```patch\n{buildGetAmountText(-amount, md=True)}\n```\n{to.mention} へ\n```patch\n{buildGetAmountText(amount, md=True)}\n```"
+            + repay_note(repaid)
         )
 
 

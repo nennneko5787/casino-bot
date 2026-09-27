@@ -32,6 +32,8 @@ async def setup_hook():
     await bot.load_extension("cogs.payment")
     await bot.load_extension("cogs.blackjack")
     await bot.load_extension("cogs.stock")
+    await bot.load_extension("cogs.ranking")
+    await bot.load_extension("cogs.loan")
     await bot.tree.sync()
 
 

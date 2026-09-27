@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, CasinoBaseException, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
 from services.othello_image import render_board_image
@@ -432,10 +433,7 @@ class OthelloGameView(discord.ui.View):
                 with suppress(
                     discord.DiscordException, SQLiteError, CasinoBaseException
                 ):
-                    user = await self.cog.bot.fetch_user(uid)
-                    data = await getUser(user)
-                    data.amount += game["bet"]
-                    await saveUser(data)
+                    await apply_income(uid, game["bet"])
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
@@ -956,18 +954,15 @@ class OthelloCog(commands.Cog):
             if result == "win":
                 payout_amount = int(bet * game["mult"])
                 profit = payout_amount - bet
-                user = await self.bot.fetch_user(player_id)
-                data = await getUser(user)
-                data.amount += payout_amount
-                await saveUser(data)
-                desc_extra = f"あなたの勝ち！\n```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                repaid, _ = await apply_income(player_id, payout_amount)
+                desc_extra = (
+                    f"あなたの勝ち！\n```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                    + repay_note(repaid)
+                )
                 color = discord.Color.green()
             elif result == "draw":
-                user = await self.bot.fetch_user(player_id)
-                data = await getUser(user)
-                data.amount += bet
-                await saveUser(data)
-                desc_extra = "引き分け！掛け金は返金されました"
+                repaid, _ = await apply_income(player_id, bet)
+                desc_extra = "引き分け！掛け金は返金されました" + repay_note(repaid)
                 color = discord.Color.gold()
             else:
                 reason = "降参しました" if resigned_id else "あなたの負け..."
@@ -982,24 +977,19 @@ class OthelloCog(commands.Cog):
             if result == "win" and winner_id is not None:
                 payout_amount = int(bet * 2 * PVP_RAKE)
                 profit = payout_amount - bet
-                user = await self.bot.fetch_user(winner_id)
-                data = await getUser(user)
-                data.amount += payout_amount
-                await saveUser(data)
+                repaid, _ = await apply_income(winner_id, payout_amount)
                 win_text = "の勝ち！"
                 if resigned_id:
                     win_text = "の勝ち！（相手が降参）"
                 desc_extra = (
                     f"<@{winner_id}>{win_text}\n"
                     f"```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                    + repay_note(repaid)
                 )
                 color = discord.Color.green()
             elif result == "draw":
                 for uid in (game["black_id"], game["white_id"]):
-                    user = await self.bot.fetch_user(uid)
-                    data = await getUser(user)
-                    data.amount += bet
-                    await saveUser(data)
+                    await apply_income(uid, bet)
                 desc_extra = "引き分け！掛け金は両者に返金されました"
                 color = discord.Color.gold()
             else:

@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
 
@@ -191,13 +192,14 @@ class DiceSetupView(discord.ui.View):
         if result["win"]:
             win_amount = int(bet * result["payout"])
             profit = win_amount - bet
-            user_data.amount += win_amount
-            await saveUser(user_data)
+            await saveUser(user_data)  # 先に掛け金分を確定させる
+            repaid, _ = await apply_income(interaction.user.id, win_amount)
             embed = discord.Embed(
                 title="ダイス🎲",
                 description=(
                     f"勝ち！\n**{result['rolled']}** でロールオーバー (**{target}**) を超えました！\n"
                     f"```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                    + repay_note(repaid)
                 ),
                 color=discord.Color.green(),
             )
@@ -476,15 +478,14 @@ class MinesBoardView(discord.ui.View):
 
         if opened_safe_count(revealed) >= total_safe:
             # 全クリア
-            user_data = await getUser(interaction.user)
-            user_data.amount += payout_amount
-            await saveUser(user_data)
+            repaid, _ = await apply_income(interaction.user.id, payout_amount)
             del self.cog.mines_games[self.author_id]
             embed = discord.Embed(
                 title="マインズ [ゲームクリア]🎉",
                 description=(
                     f"<@{self.author_id}>\n"
                     f"```patch\n{buildGetAmountText(payout_amount - bet, md=True)}\n```"
+                    + repay_note(repaid)
                 ),
                 color=discord.Color.gold(),
             )
@@ -535,15 +536,14 @@ class MinesBoardView(discord.ui.View):
         await interaction.response.defer()
         payout = calculate_payout(revealed, board)
         payout_amount = int(bet * payout)
-        user_data = await getUser(interaction.user)
-        user_data.amount += payout_amount
-        await saveUser(user_data)
+        repaid, _ = await apply_income(interaction.user.id, payout_amount)
         del self.cog.mines_games[self.author_id]
         embed = discord.Embed(
             title="マインズ [ペイアウト]",
             description=(
                 f"<@{self.author_id}>\n"
                 f"```patch\n{buildGetAmountText(payout_amount - bet, md=True)}\n```"
+                + repay_note(repaid)
             ),
             color=discord.Color.blue(),
         )

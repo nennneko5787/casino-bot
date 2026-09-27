@@ -8,6 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
 
@@ -199,10 +200,7 @@ class BlackjackView(discord.ui.View):
         if game:
             # タイムアウトは中止扱いで返金 (ベストエフォート)
             with suppress(Exception):
-                user = await self.cog.bot.fetch_user(self.author_id)
-                data = await getUser(user)
-                data.amount += game["bet"]
-                await saveUser(data)
+                await apply_income(self.author_id, game["bet"])
         for item in self.children:
             if isinstance(item, discord.ui.Button):
                 item.disabled = True
@@ -291,15 +289,11 @@ class BlackjackCog(commands.Cog):
             "push": discord.Color.greyple(),
         }
         if result in ("win", "player_bj") and payout:
-            user = await self.bot.fetch_user(author_id)
-            data = await getUser(user)
-            data.amount += payout
-            await saveUser(data)
+            repaid, _ = await apply_income(author_id, payout)
         elif result == "push":
-            user = await self.bot.fetch_user(author_id)
-            data = await getUser(user)
-            data.amount += bet
-            await saveUser(data)
+            repaid, _ = await apply_income(author_id, bet)
+        else:
+            repaid = 0
 
         embed = discord.Embed(
             title=f"ブラックジャック [{titles[result]}]",
@@ -308,6 +302,7 @@ class BlackjackCog(commands.Cog):
                 f"あなた ({hand_value(player)}): {hand_text(player)}\n"
                 f"ディーラー ({hand_value(dealer)}): {hand_text(dealer)}\n"
                 f"```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                + repay_note(repaid)
             ),
             color=colors[result],
         )

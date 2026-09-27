@@ -33,6 +33,7 @@ class Stock:
     price: int
     mu: float
     sigma: float
+    impact: float
     is_active: bool
 
 
@@ -62,6 +63,7 @@ def _row_to_stock(row) -> Stock:
         price=row["price"],
         mu=row["mu"],
         sigma=row["sigma"],
+        impact=row["impact"],
         is_active=bool(row["is_active"]),
     )
 
@@ -99,6 +101,37 @@ async def get_history(ticker: str, limit: int = 100) -> list[tuple[str, int]]:
     return [(r["created_at"], r["price"]) for r in reversed(rows)]
 
 
+async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
+    """需給影響を即時反映。qty>0=買い(上昇)/qty<0=売り(下落)。
+
+    戻り値は (新価格, 変動率)。履歴にも点を打つ。
+    """
+    ticker = normalize_ticker(ticker)
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    rate = stock.impact * qty
+    new_price = max(1, round(stock.price * (1 + rate)))
+    now = _now()
+    await DBService.pool.execute(
+        "UPDATE stocks SET price = ?, updated_at = ? WHERE ticker = ?",
+        (new_price, now, ticker),
+    )
+    await DBService.pool.execute(
+        "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
+        (ticker, new_price, now),
+    )
+    await DBService.pool.commit()
+    return new_price, (new_price - stock.price) / stock.price
+
+
+def check_impact(impact: float) -> float:
+    """impact の範囲チェック。"""
+    if not 0.0 <= impact <= 0.01:
+        raise ValueError("impactは0〜0.01の範囲で指定してください")
+    return impact
+
+
 async def tick_once(rng: random.Random | None = None) -> list[Stock]:
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。"""
     rng = rng or random.Random()
@@ -128,7 +161,11 @@ async def tick_once(rng: random.Random | None = None) -> list[Stock]:
 
 
 async def add_ticker(
-    ticker: str, price: int, mu: float = 0.0, sigma: float = 0.05
+    ticker: str,
+    price: int,
+    mu: float = 0.0,
+    sigma: float = 0.05,
+    impact: float = 0.0005,
 ) -> Stock:
     """管理者用: 新規銘柄を追加。重複・不正値は例外。"""
     ticker = normalize_ticker(ticker)
@@ -138,14 +175,15 @@ async def add_ticker(
         raise ValueError("muは-1.0〜1.0の範囲で指定してください")
     if not 0.0 < sigma <= 1.0:
         raise ValueError("sigmaは0より大きく1.0以下で指定してください")
+    check_impact(impact)
     if await get_stock(ticker):
         raise ValueError(f"{ticker} は既に存在します")
     now = _now()
     await DBService.pool.execute(
         "INSERT INTO stocks "
-        "(ticker, display_name, price, mu, sigma, is_active, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?)",
-        (ticker, ticker, price, mu, sigma, now),
+        "(ticker, display_name, price, mu, sigma, impact, is_active, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        (ticker, ticker, price, mu, sigma, impact, now),
     )
     await DBService.pool.execute(
         "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
@@ -172,7 +210,10 @@ async def set_active(ticker: str, active: bool) -> Stock:
 
 
 async def update_params(
-    ticker: str, mu: float | None = None, sigma: float | None = None
+    ticker: str,
+    mu: float | None = None,
+    sigma: float | None = None,
+    impact: float | None = None,
 ) -> Stock:
     ticker = normalize_ticker(ticker)
     stock = await get_stock(ticker)
@@ -186,9 +227,12 @@ async def update_params(
         if not 0.0 < sigma <= 1.0:
             raise ValueError("sigmaは0より大きく1.0以下で指定してください")
         stock.sigma = sigma
+    if impact is not None:
+        stock.impact = check_impact(impact)
     await DBService.pool.execute(
-        "UPDATE stocks SET mu = ?, sigma = ?, updated_at = ? WHERE ticker = ?",
-        (stock.mu, stock.sigma, _now(), ticker),
+        "UPDATE stocks SET mu = ?, sigma = ?, impact = ?, updated_at = ? "
+        "WHERE ticker = ?",
+        (stock.mu, stock.sigma, stock.impact, _now(), ticker),
     )
     await DBService.pool.commit()
     return stock
@@ -207,11 +251,12 @@ async def resolve_sigma(sigma: float | None, preset: str | None) -> float:
     return VOL_PRESETS["normal"]
 
 
-async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int]:
-    """購入。戻り値は (約定単価, 合計金額)。
+async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
+    """購入。戻り値は (約定単価, 合計金額, 需給変動率)。
 
     残高の増減も直接SQLで行うため Discord オブジェクトは不要。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
+    約定後に需給影響を即時反映する (約定単価は影響前の価格)。
     """
     ticker = normalize_ticker(ticker)
     if qty < 1:
@@ -264,11 +309,18 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int]:
             (user_id, ticker, qty, stock.price),
         )
     await DBService.pool.commit()
-    return stock.price, cost
+    _, rate = await apply_impact(ticker, qty)
+    return stock.price, cost, rate
 
 
-async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int]:
-    """売却。戻り値は (約定単価, 受取金額)。上場廃止銘柄も売却は可能。"""
+async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, float]:
+    """売却。戻り値は (約定単価, 受取金額, 借金への自動返済額, 需給変動率).
+
+    上場廃止銘柄も売却は可能。受取金額は借金返済優先で配分される。
+    約定後に需給影響を即時反映する (約定単価は影響前の価格)。
+    """
+    from services.loan import apply_income
+
     ticker = normalize_ticker(ticker)
     if qty < 1:
         raise ValueError("数量は1以上にしてください")
@@ -295,11 +347,10 @@ async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int]:
             "UPDATE holdings SET qty = ? WHERE user_id = ? AND ticker = ?",
             (new_qty, user_id, ticker),
         )
-    await DBService.pool.execute(
-        "UPDATE users SET amount = amount + ? WHERE id = ?", (proceeds, user_id)
-    )
     await DBService.pool.commit()
-    return stock.price, proceeds
+    repaid, _ = await apply_income(user_id, proceeds)
+    _, rate = await apply_impact(ticker, -qty)
+    return stock.price, proceeds, repaid, rate
 
 
 async def get_portfolio(user_id: int) -> list[dict]:

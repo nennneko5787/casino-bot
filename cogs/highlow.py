@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildAmountText, buildGetAmountText
 from services.money import getUser, saveUser
 
@@ -207,15 +208,14 @@ class HighLowView(discord.ui.View):
         bet, multiplier = game["bet"], game["multiplier"]
         payout_amount = int(bet * multiplier)
         profit = payout_amount - bet
-        user_data = await getUser(interaction.user)
-        user_data.amount += payout_amount
-        await saveUser(user_data)
+        repaid, _ = await apply_income(interaction.user.id, payout_amount)
         del self.cog.games[self.author_id]
         embed = discord.Embed(
             title="ハイアンドロー [ペイアウト]💰",
             description=(
                 f"<@{self.author_id}>\n"
                 f"```patch\n{buildGetAmountText(profit, md=True)}\n```"
+                + repay_note(repaid)
             ),
             color=discord.Color.gold(),
         )

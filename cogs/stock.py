@@ -13,6 +13,7 @@ from discord.ext import commands, tasks
 
 from objects.exceptions import AmountNotEnough
 from services import stocks
+from services.loan import repay_note
 from services.message import amountName, buildAmountText, buildGetAmountText
 from services.stock_chart import render_stock_chart
 
@@ -106,7 +107,7 @@ class StockCog(commands.Cog):
             await ctx.reply("数量は1以上にしてください", ephemeral=True)
             return
         try:
-            price, cost = await stocks.buy(ctx.author.id, ticker, qty)
+            price, cost, rate = await stocks.buy(ctx.author.id, ticker, qty)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
@@ -120,6 +121,7 @@ class StockCog(commands.Cog):
                     f"`{ticker.strip().upper()}` を {qty}株 @"
                     f"{buildAmountText(price)}\n"
                     f"```patch\n{buildGetAmountText(-cost, md=True)}\n```"
+                    f"\n需給影響 {rate:+.2%} で価格が動きました"
                 ),
                 color=discord.Color.green(),
             )
@@ -135,7 +137,9 @@ class StockCog(commands.Cog):
             await ctx.reply("数量は1以上にしてください", ephemeral=True)
             return
         try:
-            price, proceeds = await stocks.sell(ctx.author.id, ticker, qty)
+            price, proceeds, repaid, rate = await stocks.sell(
+                ctx.author.id, ticker, qty
+            )
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
@@ -147,6 +151,8 @@ class StockCog(commands.Cog):
                     f"`{ticker.strip().upper()}` を {qty}株 @"
                     f"{buildAmountText(price)}\n"
                     f"```patch\n{buildGetAmountText(proceeds, md=True)}\n```"
+                    + repay_note(repaid)
+                    + f"\n需給影響 {rate:+.2%} で価格が動きました"
                 ),
                 color=discord.Color.gold(),
             )
@@ -176,7 +182,7 @@ class StockCog(commands.Cog):
             title=f"{name} チャート📈",
             description=(
                 f"現在値: {buildAmountText(stock.price)}\n"
-                f"mu={stock.mu} sigma={stock.sigma}"
+                f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact:.4f}/株"
                 + ("" if stock.is_active else "\n※取扱停止中")
             ),
             color=discord.Color.blue(),
@@ -235,7 +241,12 @@ class StockCog(commands.Cog):
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
     @app_commands.rename(
-        ticker="銘柄", price="開始価格", mu="mu", sigma="sigma", preset="プリセット"
+        ticker="銘柄",
+        price="開始価格",
+        mu="mu",
+        sigma="sigma",
+        preset="プリセット",
+        impact="impact",
     )
     @app_commands.describe(
         ticker="英数字1〜10文字 (例: SONY)",
@@ -243,6 +254,7 @@ class StockCog(commands.Cog):
         mu="平均成長率 -1.0〜1.0 (省略時0)",
         sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
         preset="指定するとsigmaの代わりに使われます",
+        impact="需給感応度 0〜0.01/株 (省略時0.0005)",
     )
     @app_commands.choices(
         preset=[
@@ -259,19 +271,20 @@ class StockCog(commands.Cog):
         mu: float = 0.0,
         sigma: float | None = None,
         preset: app_commands.Choice[str] | None = None,
+        impact: float = 0.0005,
     ):
         try:
             resolved = await stocks.resolve_sigma(
                 sigma, preset.value if preset else None
             )
-            stock = await stocks.add_ticker(ticker, price, mu, resolved)
+            stock = await stocks.add_ticker(ticker, price, mu, resolved, impact)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
         await ctx.reply(
             f"`{stock.ticker}` を上場しました: "
             f"{buildAmountText(stock.price)} "
-            f"(mu={stock.mu} sigma={stock.sigma})"
+            f"(mu={stock.mu} sigma={stock.sigma} impact={stock.impact})"
         )
 
     @stockAdmin.command(name="delist", brief="※管理者専用 銘柄を取扱停止します")
@@ -300,11 +313,11 @@ class StockCog(commands.Cog):
             return
         await ctx.reply(f"`{stock.ticker}` の取扱を再開しました")
 
-    @stockAdmin.command(name="params", brief="※管理者専用 mu/sigmaを変更します")
+    @stockAdmin.command(name="params", brief="※管理者専用 mu/sigma/impactを変更します")
     @commands.has_guild_permissions(administrator=True)
     @commands.guild_only()
-    @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma")
-    @app_commands.describe(mu="省略可", sigma="省略可")
+    @app_commands.rename(ticker="銘柄", mu="mu", sigma="sigma", impact="impact")
+    @app_commands.describe(mu="省略可", sigma="省略可", impact="省略可")
     @app_commands.autocomplete(ticker=ticker_autocomplete)
     async def stockParamsCommand(
         self,
@@ -312,16 +325,22 @@ class StockCog(commands.Cog):
         ticker: str,
         mu: float | None = None,
         sigma: float | None = None,
+        impact: float | None = None,
     ):
-        if mu is None and sigma is None:
-            await ctx.reply("muかsigmaのどちらかを指定してください", ephemeral=True)
+        if mu is None and sigma is None and impact is None:
+            await ctx.reply(
+                "mu・sigma・impactのいずれかを指定してください", ephemeral=True
+            )
             return
         try:
-            stock = await stocks.update_params(ticker, mu, sigma)
+            stock = await stocks.update_params(ticker, mu, sigma, impact)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
-        await ctx.reply(f"`{stock.ticker}` を更新: mu={stock.mu} sigma={stock.sigma}")
+        await ctx.reply(
+            f"`{stock.ticker}` を更新: "
+            f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact}"
+        )
 
 
 async def setup(bot: commands.Bot):

@@ -5,3 +5,4 @@ from dataclasses import dataclass
 class User:
     id: int
     amount: int
+    debt: int = 0

@@ -10,8 +10,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, EmojiNotFound, YouMustDie
+from services.loan import apply_income, repay_note
 from services.message import buildGetAmountText
-from services.money import getUser, saveUser
+from services.money import getUser
 
 dotenv.load_dotenv()
 
@@ -172,8 +173,8 @@ class SlotCog(commands.Cog):
         """スロットを1回回して結果を message に反映する。戻り値は reward。"""
         if amount < 0:
             raise YouMustDie()
-        preCheck = await getUser(user)
-        if preCheck.amount < amount:
+        userData = await getUser(user)
+        if userData.amount < amount:
             raise AmountNotEnough()
 
         slotOutputs = random.choices(
@@ -201,9 +202,7 @@ class SlotCog(commands.Cog):
         else:
             reward = -amount
 
-        userData = await getUser(user)
-        userData.amount += reward
-        await saveUser(userData)
+        repaid, _ = await apply_income(user.id, reward)
 
         if view is None:
             view = SlotRetryView(self, user.id, amount)
@@ -213,7 +212,7 @@ class SlotCog(commands.Cog):
                 f"{''.join(slotOutputs)}\n"
                 "```patch\n"
                 f"{buildGetAmountText(reward, md=True)}\n"
-                "```"
+                "```" + repay_note(repaid)
             ),
             view=view,
         )
