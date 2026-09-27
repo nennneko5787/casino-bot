@@ -4,6 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from objects.exceptions import AmountNotEnough, YouMustDie
+from services.admin import admin_only
 from services.loan import apply_income, repay_note
 from services.message import buildGetAmountText
 from services.money import getUser, saveUser
@@ -18,7 +19,7 @@ class PaymentCog(commands.Cog):
     @commands.hybrid_command(
         "give", brief="※管理者専用 無から所持金を生成して他のメンバーに付与します"
     )
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(amount="あげる額", to="対象")
     @app_commands.describe(amount="この額をあげます", to="ここで指定した人にあげます")

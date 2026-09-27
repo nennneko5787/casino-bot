@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands, tasks
 
 from services import missions
+from services.admin import admin_only
 from services.loan import repay_note
 from services.message import (
     amountName,
@@ -384,7 +385,7 @@ class MissionCog(commands.Cog):
     @commands.hybrid_group(
         name="mission-admin", brief="※管理者専用 ミッション設定をします"
     )
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def missionAdmin(self, ctx: commands.Context):
         await ctx.reply(
@@ -393,7 +394,7 @@ class MissionCog(commands.Cog):
         )
 
     @missionAdmin.command(name="channel", brief="※管理者専用 指定chを設定します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def missionChannelCommand(
         self, ctx: commands.Context, ch: discord.TextChannel
@@ -402,14 +403,14 @@ class MissionCog(commands.Cog):
         await ctx.reply(f"指定チャンネルを <#{ch.id}> に設定しました")
 
     @missionAdmin.command(name="unset-channel", brief="※管理者専用 指定chを解除します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def missionUnsetChannelCommand(self, ctx: commands.Context):
         await missions.set_mission_channel(None)
         await ctx.reply("指定チャンネルを解除しました")
 
     @missionAdmin.command(name="status", brief="※管理者専用 設定を確認します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def missionStatusCommand(self, ctx: commands.Context):
         channel_id = await missions.get_mission_channel()

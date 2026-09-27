@@ -7,13 +7,15 @@
 import discord
 from discord.ext import commands
 
+from services.admin import admin_only
+
 
 class SyncCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @commands.command("sync", brief="※管理者専用 スラッシュコマンドを同期します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def syncCommand(self, ctx: commands.Context):
         synced = await self.bot.tree.sync()

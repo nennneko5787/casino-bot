@@ -20,6 +20,7 @@ MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 import re
@@ -28,8 +29,17 @@ from datetime import UTC, datetime, timedelta
 
 from services.database import DBService
 
+logger = logging.getLogger(__name__)
+
 TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
 HISTORY_KEEP = 200
+
+# SQLite INTEGER は符号付き64bit (最大 9223372036854775807)。
+# 幾何ランダムウォークは指数関数的に膨らむため、上限なしだと
+# Python int -> SQLite への変換で OverflowError になる。
+# tick が止まると全銘柄が更新されなくなるので価格に上限を設ける。
+SQLITE_MAX_INT = 9223372036854775807
+MAX_PRICE = 1_000_000_000_000  # 1兆。初期価格(数百〜数千)から十分に離しつつ安全域
 
 # 会社設立の手数料 (消滅) と mu ボーナスの換算
 FOUNDING_FEE = 1000
@@ -100,15 +110,35 @@ def normalize_ticker(raw: str) -> str:
 
 
 def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
-    """幾何ランダムウォークで1歩進める。下限1。
+    """幾何ランダムウォークで1歩進める。下限1・上限MAX_PRICE。
 
     丸めは確率的 (stochastic rounding) にすることで期待値を保ちつつ、
     価格1が吸着点にならないようにする (1でも毎tick数%の確率で2に脱出)。
     """
-    shock = rng.gauss(0.0, 1.0)
-    exact = price * math.exp((mu - sigma * sigma / 2) + sigma * shock)
-    stepped = math.floor(exact + rng.random())
-    return max(1, stepped)
+    try:
+        shock = rng.gauss(0.0, 1.0)
+        exact = price * math.exp((mu - sigma * sigma / 2) + sigma * shock)
+    except (OverflowError, ValueError):
+        # exp が発散した場合は方向だけ見て端に張り付ける
+        return MAX_PRICE if mu >= 0 else 1
+    try:
+        stepped = math.floor(exact + rng.random())
+    except (OverflowError, ValueError):
+        return MAX_PRICE
+    return _clamp_price(stepped)
+
+
+def _clamp_price(v: int) -> int:
+    """価格を SQLite に入る範囲 [1, MAX_PRICE] に丸める。"""
+    try:
+        iv = int(v)
+    except (OverflowError, ValueError):
+        return MAX_PRICE
+    if iv < 1:
+        return 1
+    if iv > MAX_PRICE:
+        return MAX_PRICE
+    return iv
 
 
 def _now() -> str:
@@ -213,10 +243,10 @@ async def apply_impact(ticker: str, qty: int) -> tuple[int, float]:
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
     rate = dampen_impact_rate(stock.impact * qty)
-    new_price = max(1, round(stock.price * (1 + rate)))
+    new_price = _clamp_price(round(stock.price * (1 + rate)))
     if rate != 0.0 and new_price == stock.price:
         # 丸めで同値になる場合も最低1は動かす (価格1の吸着防止)。下限1。
-        new_price = max(1, stock.price + (1 if rate > 0 else -1))
+        new_price = _clamp_price(stock.price + (1 if rate > 0 else -1))
     now = _now()
     await DBService.pool.execute(
         "UPDATE stocks SET price = ?, updated_at = ? WHERE ticker = ?",
@@ -267,7 +297,17 @@ async def tick_once(
     updated: list[Stock] = []
     bankrupted: list[dict] = []
     for stock in stocks:
-        new_price = step_price(stock.price, stock.mu, stock.sigma, rng)
+        try:
+            # DBに既に入っている異常値 (上限超え) はまず上限に丸めて回復させる
+            if stock.price > MAX_PRICE or stock.price < 1:
+                stock.price = _clamp_price(stock.price)
+            new_price = _clamp_price(
+                step_price(stock.price, stock.mu, stock.sigma, rng)
+            )
+        except Exception:
+            # 1銘柄の計算失敗で全体を止めない
+            logger.exception("株価tickの計算に失敗 ticker=%s", stock.ticker)
+            continue
         if new_price <= 1:
             cursor = await DBService.pool.execute(
                 "SELECT floor_since FROM stocks WHERE ticker = ?",
@@ -349,7 +389,7 @@ async def tick_once(
         (
             now_iso,
             avg_row["a"] if avg_row and avg_row["a"] else 0,
-            sup_row["s"] if sup_row else 0,
+            min(sup_row["s"], SQLITE_MAX_INT) if sup_row and sup_row["s"] else 0,
         ),
     )
     await DBService.pool.execute(
@@ -392,6 +432,8 @@ async def add_ticker(
     ticker = normalize_ticker(ticker)
     if price < 1:
         raise ValueError("開始価格は1以上にしてください")
+    if price > MAX_PRICE:
+        raise ValueError(f"開始価格は{MAX_PRICE:,}以下にしてください")
     if not -1.0 <= mu <= 1.0:
         raise ValueError("muは-1.0〜1.0の範囲で指定してください")
     if not 0.0 < sigma <= 1.0:
@@ -446,6 +488,8 @@ async def set_price(ticker: str, price: int) -> Stock:
     ticker = normalize_ticker(ticker)
     if price < 1:
         raise ValueError("価格は1以上にしてください")
+    if price > MAX_PRICE:
+        raise ValueError(f"価格は{MAX_PRICE:,}以下にしてください")
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
@@ -485,6 +529,8 @@ async def create_company(
     ticker = normalize_ticker(ticker)
     if invest < 1:
         raise ValueError("投資額は1以上にしてください")
+    if invest > MAX_PRICE:
+        raise ValueError(f"投資額は{MAX_PRICE:,}以下にしてください")
     if not -1.0 <= mu <= 1.0:
         raise ValueError("muは-1.0〜1.0の範囲で指定してください")
     if not 0.0 < sigma <= 1.0:
@@ -631,6 +677,8 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
     ticker = normalize_ticker(ticker)
     if qty < 1:
         raise ValueError("数量は1以上にしてください")
+    if qty > SQLITE_MAX_INT:
+        raise ValueError("数量が多すぎます")
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
@@ -653,6 +701,8 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float]:
         balance = row["amount"]
 
     cost = stock.price * qty
+    if cost > SQLITE_MAX_INT:
+        raise ValueError("数量が多すぎます (合計金額が上限を超えます)")
     if balance < cost:
         # 金額表示は呼び出し側で AmountNotEnough に変換させる
         raise LookupError(f"残高不足: 必要 {cost}")
@@ -696,6 +746,8 @@ async def sell(user_id: int, ticker: str, qty: int) -> tuple[int, int, int, floa
     ticker = normalize_ticker(ticker)
     if qty < 1:
         raise ValueError("数量は1以上にしてください")
+    if qty > SQLITE_MAX_INT:
+        raise ValueError("数量が多すぎます")
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")

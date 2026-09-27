@@ -18,6 +18,7 @@ from discord.ext import commands, tasks
 
 from objects.exceptions import AmountNotEnough
 from services import missions, stocks
+from services.admin import admin_only
 from services.loan import repay_note
 from services.message import amountName, buildAmountText, buildGetAmountText
 from services.stock_chart import (
@@ -474,7 +475,7 @@ class StockCog(commands.Cog):
     # ---------- /stock-admin グループ ----------
 
     @commands.hybrid_group(name="stock-admin", brief="※管理者専用 銘柄を管理します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def stockAdmin(self, ctx: commands.Context):
         await ctx.reply(
@@ -484,7 +485,7 @@ class StockCog(commands.Cog):
         )
 
     @stockAdmin.command(name="add", brief="※管理者専用 銘柄を追加します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(
         ticker="銘柄",
@@ -559,7 +560,7 @@ class StockCog(commands.Cog):
         )
 
     @stockAdmin.command(name="delist", brief="※管理者専用 銘柄を取扱停止します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -572,7 +573,7 @@ class StockCog(commands.Cog):
         await ctx.reply(f"`{stock.ticker}` を取扱停止しました（売却は可能）")
 
     @stockAdmin.command(name="relist", brief="※管理者専用 取扱停止を解除します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄")
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -585,7 +586,7 @@ class StockCog(commands.Cog):
         await ctx.reply(f"`{stock.ticker}` の取扱を再開しました")
 
     @stockAdmin.command(name="set-price", brief="※管理者専用 価格を直接設定します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(ticker="銘柄", price="価格")
     @app_commands.describe(ticker="例: GMO", price="設定する価格 (1以上)")
@@ -603,7 +604,7 @@ class StockCog(commands.Cog):
         )
 
     @stockAdmin.command(name="params", brief="※管理者専用 mu/sigma/impactを変更します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(
         ticker="銘柄",

@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from services import levels, missions
+from services.admin import admin_only
 from services.level_card import (
     render_level_card,
     render_level_ranking,
@@ -167,6 +168,8 @@ class LevelCog(commands.Cog):
     def _notify_channel(
         self, guild: discord.Guild | None
     ) -> discord.TextChannel | None:
+        # ※ VC由来のレベルアップを別チャンネルへ自動投稿しない方針のため、
+        # 現在は未使用 (チャット由来は発言チャンネルへ返す)。互換のため残す。
         if guild is None:
             return None
         ch = guild.system_channel
@@ -234,17 +237,12 @@ class LevelCog(commands.Cog):
         if gained <= 0:
             return
         try:
-            reward, repaid = await self._grant_reward_and_missions(
-                member.id, gained, old, new
-            )
+            await self._grant_reward_and_missions(member.id, gained, old, new)
         except Exception:
             logger.exception("VC-XPの報酬記録に失敗")
             return
-        if new > old and member.guild is not None:
-            with suppress(Exception):
-                ch = self._notify_channel(member.guild)
-                if ch is not None:
-                    await _send_levelup(ch, member, old, new, gained, reward, repaid)
+        # VC退室時のレベルアップ通知は別チャンネルへの自動投稿になるため送らない。
+        # 報酬・ミッション記録のみ行い、通知は /level コマンドでの確認に任せる。
 
     @tasks.loop(minutes=5.0)
     async def vc_flush(self):
@@ -255,25 +253,11 @@ class LevelCog(commands.Cog):
             return
         for user_id, minutes, gained, old, new in results:
             try:
-                reward, repaid = await self._grant_reward_and_missions(
-                    user_id, gained, old, new
-                )
+                await self._grant_reward_and_missions(user_id, gained, old, new)
             except Exception:
                 logger.exception("VC-XPの報酬記録に失敗 user=%s", user_id)
                 continue
-            if new > old:
-                with suppress(Exception):
-                    for guild in self.bot.guilds:
-                        member = guild.get_member(user_id)
-                        if member is None:
-                            continue
-                        ch = self._notify_channel(guild)
-                        if ch is None:
-                            continue
-                        await _send_levelup(
-                            ch, member, old, new, gained, reward, repaid
-                        )
-                        break
+            # 定期精算でのレベルアップ通知は別チャンネルへの自動投稿になるため送らない。
 
     @vc_flush.before_loop
     async def _before_flush(self):
@@ -349,7 +333,7 @@ class LevelCog(commands.Cog):
     @commands.hybrid_group(
         name="level-admin", brief="※管理者専用 レベル情報を操作します"
     )
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     async def levelAdmin(self, ctx: commands.Context):
         await ctx.reply(
@@ -358,7 +342,7 @@ class LevelCog(commands.Cog):
         )
 
     @levelAdmin.command(name="add", brief="※管理者専用 XPを付与します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(member="対象", amount="xp量")
     @app_commands.describe(amount="付与するXP量 (1以上)", member="付与対象")
@@ -378,7 +362,7 @@ class LevelCog(commands.Cog):
         await ctx.reply(msg)
 
     @levelAdmin.command(name="reset", brief="※管理者専用 レベル情報を初期化します")
-    @commands.has_guild_permissions(administrator=True)
+    @admin_only()
     @commands.guild_only()
     @app_commands.rename(member="対象")
     async def levelResetCommand(self, ctx: commands.Context, member: discord.Member):

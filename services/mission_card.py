@@ -97,7 +97,7 @@ def render_mission_page(
     amount_name: str = "pt",
 ) -> io.BytesIO:
     accent = PERIOD_ACCENT.get(period, (150, 170, 255))
-    row_h, gap = 150, 14
+    row_h, gap = 170, 14
     header_h, footer_h = 268, 96
     H = header_h + max(len(entries), 1) * (row_h + gap) + footer_h + 24
     img, d = _base(H, accent)
@@ -156,23 +156,24 @@ def render_mission_page(
         # ID
         d.text((bx1 + 14, by0 + 2), f"[{e.get('id', '?')}]", font=_font(24), fill=TEXT_SUB + (255,))
 
-        # タイトル + 報酬
+        # タイトル + 報酬 (報酬を先に決めてタイトル幅を確保し、横方向の被りも防ぐ)
         title = str(e.get("title", ""))
-        tf = _fit(title, 640, 34, d)
-        _shadow(d, (x0 + 20, y0 + 62), title, tf, TEXT_MAIN + (255,))
         reward_s = f"+{int(e.get('reward', 0)):,}{amount_name}"
         rb = d.textbbox((0, 0), reward_s, font=_font(30))
         rw = rb[2] - rb[0] + 40
         rx1 = x1 - 20
         rx0 = rx1 - rw
+        title_max_w = max(200, rx0 - (x0 + 20) - 16)
+        tf = _fit(title, title_max_w, 32, d)
+        _shadow(d, (x0 + 20, y0 + 62), title, tf, TEXT_MAIN + (255,))
         d.rounded_rectangle([rx0, y0 + 18, rx1, y0 + 62], radius=22, fill=(255, 205, 92, 255))
         d.text(((rx0 + rx1) / 2, (y0 + 18 + y0 + 62) / 2 - 1), reward_s, font=_font(30), fill=(40, 28, 8, 255), anchor="mm")
 
-        # 進捗バー
+        # 進捗バー (タイトルと1行分空けて重ならないように配置)
         prog = int(e.get("progress", 0))
         target = max(int(e.get("target", 1)), 1)
         ratio = max(0.0, min(1.0, prog / target))
-        bar_x, bar_y, bar_w, bar_h = x0 + 20, y1 - 62, x1 - x0 - 220, 20
+        bar_x, bar_y, bar_w, bar_h = x0 + 20, y0 + 108, x1 - x0 - 220, 20
         d.rounded_rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], radius=10, fill=(10, 12, 32))
         fw = int(bar_w * ratio)
         if fw > 0:
