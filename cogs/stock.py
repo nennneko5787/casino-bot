@@ -1,15 +1,14 @@
-"""株価: 売買 + 会社設立 + 折れ線チャート + 管理者の銘柄追加。
+"""株価: 売買 + 会社設立 + 折れ線チャート + 株式市場。
 
-一般: /stock buy|sell|create|invest|retire|reopen|chart|currency|portfolio|list
-管理者: /stock-admin add|delist|relist|params|set-price
+一般: /stock buy|sell|create|invest|rescue|retire|reopen|chart|currency|portfolio|list
+管理者: /stock-admin add|move|delist|relist|set-price
+管理者: /stock-market create|update|delete|list
 
-会社はレベル連動枠 (10Lvごとに+1社・上限5社、設立手数料1000+投資金、開始株価=投資金、
-mu/sigma/impactは投資額ランクで自動決定、
-創業者株+売買ロイヤリティ+値上がり配当あり)。
-自社株は買増不可・売却のみ可。
-開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
-会社は破産 (保有株は紙くず・会社消去)。下落が止まって1時間続くか、
-開始価格以上に回復すれば脱出。
+銘柄は株式市場に所属し、市場ごとに値動きレンジ (mu/sigma/impact) と
+HP倒産ルールが違う。mu/sigma/impactは5分ごとに市場レンジ内で自動再抽選
+され、個別指定はできない (params廃止)。
+倒産はHP制 + 追証制: 下落でHPが減り、警告ライン以下で経営危機に入る。
+設立者が追証 (rescue) で回復しなければ破産 (保有株は紙くず・会社消去)。
 """
 
 import asyncio
@@ -37,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 CHART_NAME = "chart.png"
 TICK_INTERVAL_MINUTES = 1.0
+LIST_PAGE_SIZE = 10
 
 
 async def ticker_autocomplete(
@@ -61,10 +61,156 @@ async def ticker_autocomplete(
     return choices[:25]
 
 
+async def market_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """市場のオートコンプリート。"""
+    try:
+        items = await stocks.get_markets()
+    except Exception:
+        logger.exception("市場候補の取得に失敗")
+        return []
+    current = current.strip().upper()
+    return [
+        app_commands.Choice(name=f"{m.display_name} ({m.description[:40]})", value=m.id)
+        for m in items
+        if current in m.id or current in m.display_name.upper()
+    ][:25]
+
+
+def _hp_bar(hp: int, hp_max: int, width: int = 10) -> str:
+    """HPバー (例: ██████░░░░ 62/100)。"""
+    if hp_max < 1:
+        return ""
+    filled = max(0, min(width, round(hp / hp_max * width)))
+    return f"{'█' * filled}{'░' * (width - filled)} {hp}/{hp_max}"
+
+
+async def build_stock_list_embed(
+    market_id: str, page: int
+) -> tuple[discord.Embed, int, str]:
+    """市場別の一覧Embedを作る。戻り値は (embed, 総ページ数, 市場ID)。"""
+    markets = await stocks.get_markets()
+    if not markets:
+        return (
+            discord.Embed(title="株価一覧📈", description="市場がありません"),
+            1,
+            market_id,
+        )
+    market = next((m for m in markets if m.id == market_id), markets[0])
+    items = [
+        s for s in await stocks.get_stocks(active_only=False)
+        if s.market_id == market.id
+    ]
+    total_pages = max((len(items) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE, 1)
+    page = max(0, min(page, total_pages - 1))
+    lines = []
+    for s in items[page * LIST_PAGE_SIZE:(page + 1) * LIST_PAGE_SIZE]:
+        history = await stocks.get_history(s.ticker, 2)
+        if len(history) >= 2:
+            diff = history[-1][1] - history[-2][1]
+            mark = f"({diff:+})"
+        else:
+            mark = ""
+        status = "" if s.is_active else " [取扱停止]"
+        owner = f" [U:<@{s.owner_id}>]" if s.owner_id is not None else ""
+        crisis, _ = stocks.crisis_info(s, market)
+        crisis_mark = " ⚠️経営危機" if crisis else ""
+        lines.append(
+            f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{owner}\n"
+            f"{_hp_bar(s.hp, market.hp_max)}{crisis_mark}"
+        )
+    desc = "\n".join(lines) if lines else "銘柄がありません"
+    embed = discord.Embed(
+        title=f"{market.display_name} 一覧📈 (p.{page + 1}/{total_pages})",
+        description=desc,
+        color=discord.Color.blue(),
+    )
+    embed.set_footer(text=f"市場: {market.display_name}／全{len(markets)}市場")
+    return embed, total_pages, market.id
+
+
+class MarketSelect(discord.ui.Select):
+    """一覧View用の市場セレクト。選択で市場を切り替える。"""
+
+    def __init__(self, markets: list[stocks.Market], current: str):
+        super().__init__(
+            placeholder="市場を選択",
+            options=[
+                discord.SelectOption(
+                    label=m.display_name,
+                    value=m.id,
+                    description=(m.description[:100] or None),
+                    default=(m.id == current),
+                )
+                for m in markets[:25]
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, StockListView):
+            await view.on_market_selected(interaction, self.values[0])
+
+
+class StockListView(discord.ui.View):
+    """市場別一覧のページネーションView (市場セレクト + 前へ/次へ)。"""
+
+    def __init__(self, market_id: str, markets: list[stocks.Market]):
+        super().__init__(timeout=180)
+        self.market_id = market_id
+        self.page = 0
+        self.total_pages = 1
+        self.message: discord.Message | None = None
+        self.market_select = MarketSelect(markets, market_id)
+        self.add_item(self.market_select)
+
+    async def on_market_selected(
+        self, interaction: discord.Interaction, market_id: str
+    ):
+        self.market_id = market_id
+        self.page = 0
+        for o in self.market_select.options:
+            o.default = o.value == self.market_id
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="◀ 前へ", style=discord.ButtonStyle.secondary)
+    async def prev_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.page = max(self.page - 1, 0)
+        await self.refresh(interaction)
+
+    @discord.ui.button(label="次へ ▶", style=discord.ButtonStyle.secondary)
+    async def next_page(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.page = min(self.page + 1, max(self.total_pages - 1, 0))
+        await self.refresh(interaction)
+
+    async def refresh(self, interaction: discord.Interaction):
+        embed, total, mid = await build_stock_list_embed(self.market_id, self.page)
+        self.market_id = mid
+        self.total_pages = total
+        self.page = max(0, min(self.page, total - 1))
+        self.prev_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= total - 1
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            if isinstance(item, (discord.ui.Button, discord.ui.Select)):
+                item.disabled = True
+        if self.message is not None:
+            with suppress(Exception):
+                await self.message.edit(view=self)
+
+
 class StockCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_tick_at: float | None = None
+        self._tick_count = 0
 
     async def cog_load(self):
         self.tick_loop.start()
@@ -83,7 +229,7 @@ class StockCog(commands.Cog):
     async def _log_channel(
         self, guild: discord.Guild | None
     ) -> discord.abc.Messageable | None:
-        """倒産関連通知先。envのlog_channel優先、なければ従来の通知先。"""
+        """経営危機・破産関連通知先。envのlog_channel優先、なければ従来の通知先。"""
         if guild is not None:
             raw = os.environ.get("log_channel", "").strip()
             if raw.isdigit():
@@ -108,33 +254,36 @@ class StockCog(commands.Cog):
         if self._last_tick_at is not None and now - self._last_tick_at < 45:
             return
         self._last_tick_at = now
+        self._tick_count += 1
         try:
             _, bankrupted, warned, escaped = await stocks.tick_once()
+            # 5分ごとに mu/sigma/impact を市場レンジ内で再抽選する
+            if self._tick_count % stocks.RANDOMIZE_EVERY_TICKS == 0:
+                with suppress(Exception):
+                    await stocks.randomize_params()
         except Exception:
             logger.exception("株価の定期更新に失敗")
             return
         for info in warned:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
-                f"⚠️ `{info['ticker']}` が倒産危機です"
-                f"（開始{buildAmountText(info['start_price'])}"
-                f"・危険ライン{buildAmountText(info['threshold'])}"
-                f"→現在{buildAmountText(info['price'])}）\n"
-                f"設立者: {owner}／下落が{stocks.BANKRUPT_DANGER_HOURS}時間続けば破産、"
-                "止まれば脱出します"
+                f"⚠️ `{info['ticker']}` が経営危機です"
+                f"（市場{info['market_id']}・HP {info['hp']}）\n"
+                f"設立者: {owner}／{info['deadline_hours']:g}時間以内に"
+                "`/stock rescue` で追証しなければ破産します"
             )
         for info in escaped:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
-                f"✅ `{info['ticker']}` が危険水域から脱出しました"
-                f"（現在{buildAmountText(info['price'])}）\n"
+                f"✅ `{info['ticker']}` が経営危機から脱出しました"
+                f"（市場{info['market_id']}・HP {info['hp']}）\n"
                 f"設立者: {owner}"
             )
         for info in bankrupted:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
                 f"💸 `{info['ticker']}` が破産しました"
-                f"（開始価格の50%割れが{stocks.BANKRUPT_DANGER_HOURS}時間継続）\n"
+                f"（市場{info['market_id']}・HP枯渇）\n"
                 f"設立者: {owner}／保有株は紙くずになりました"
             )
 
@@ -166,36 +315,37 @@ class StockCog(commands.Cog):
     async def stock(self, ctx: commands.Context):
         await ctx.reply(
             "サブコマンドを指定してください: "
-            "buy / sell / create / invest / retire / reopen / chart / currency / "
-            "portfolio / list",
+            "buy / sell / create / invest / rescue / retire / reopen / chart / "
+            "currency / portfolio / list",
             ephemeral=True,
         )
 
-    @stock.command(name="list", brief="上場中の銘柄一覧を表示します")
+    @stock.command(name="list", brief="市場ごとの銘柄一覧を表示します")
+    @app_commands.rename(market="市場")
+    @app_commands.describe(market="市場 (省略時は最初の市場)")
+    @app_commands.autocomplete(market=market_autocomplete)
     @commands.guild_only()
-    async def stockListCommand(self, ctx: commands.Context):
-        items = await stocks.get_stocks(active_only=False)
-        lines = []
-        for s in items:
-            history = await stocks.get_history(s.ticker, 2)
-            if len(history) >= 2:
-                diff = history[-1][1] - history[-2][1]
-                mark = f"({diff:+})"
-            else:
-                mark = ""
-            status = "" if s.is_active else " [取扱停止]"
-            owner = f" [U:<@{s.owner_id}>]" if s.owner_id is not None else ""
-            in_danger, elapsed = stocks.danger_info(s)
-            danger = f" ⚠️危険水域({elapsed:.1f}h経過)" if in_danger else ""
-            lines.append(
-                f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{danger}{owner}"
-            )
-        desc = "\n".join(lines) if lines else "銘柄がありません"
-        await ctx.reply(
-            embed=discord.Embed(
-                title="株価一覧📈", description=desc, color=discord.Color.blue()
-            )
-        )
+    async def stockListCommand(
+        self, ctx: commands.Context, market: str | None = None
+    ):
+        markets = await stocks.get_markets()
+        if not markets:
+            await ctx.reply("市場がありません", ephemeral=True)
+            return
+        market_id = market or markets[0].id
+        try:
+            market_id = stocks.normalize_market_id(market_id)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        embed, total, mid = await build_stock_list_embed(market_id, 0)
+        view = StockListView(mid, markets)
+        view.total_pages = total
+        view.prev_page.disabled = True
+        view.next_page.disabled = total <= 1
+        sent = await ctx.reply(embed=embed, view=view)
+        if isinstance(sent, discord.Message):
+            view.message = sent
 
     @stock.command(name="buy", brief="株を買います")
     @app_commands.rename(ticker="銘柄", qty="数量")
@@ -364,26 +514,30 @@ class StockCog(commands.Cog):
         history = await stocks.get_history(name, count)
         buf = await asyncio.to_thread(render_stock_chart, history, name, amountName)
         file = discord.File(buf, filename=CHART_NAME)
-        in_danger, elapsed = stocks.danger_info(stock)
-        if in_danger:
-            rest = stocks.danger_remaining_hours(stock)
-            danger_note = (
-                f"\n⚠️倒産危機: 開始{buildAmountText(stock.start_price)}"
-                f"→現在{buildAmountText(stock.price)}"
-                f" ({elapsed:.1f}h経過・残り約{rest:.1f}h)"
-            )
+        market = await stocks.get_market(stock.market_id)
+        market_name = market.display_name if market else stock.market_id
+        hp_max = market.hp_max if market else stocks.HP_MAX
+        if market:
+            in_crisis, elapsed = stocks.crisis_info(stock, market)
+            if in_crisis:
+                rest = stocks.rescue_deadline_hours(stock, market)
+                hp_note = (
+                    f"\n⚠️経営危機: HP {_hp_bar(stock.hp, hp_max)}"
+                    f" ({elapsed:.1f}h経過・残り約{rest:.1f}h)"
+                    "\n追証は `/stock rescue` で"
+                )
+            else:
+                hp_note = f"\nHP: {_hp_bar(stock.hp, hp_max)}"
         else:
-            danger_note = (
-                f"\n開始価格: {buildAmountText(stock.start_price)}"
-                " (割れると倒産危機)"
-            )
+            hp_note = ""
+        market_note = f"\n市場: {market_name}{hp_note}"
         embed = discord.Embed(
             title=f"{name} チャート📈",
             description=(
                 f"現在値: {buildAmountText(stock.price)}\n"
                 f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact:.4f}/株"
                 + ("" if stock.is_active else "\n※取扱停止中")
-                + danger_note
+                + market_note
             ),
             color=discord.Color.blue(),
         )
@@ -421,11 +575,22 @@ class StockCog(commands.Cog):
         if not items:
             await ctx.reply("保有株はありません", ephemeral=True)
             return
+        markets = await stocks.get_markets()
+        market_names = {m.id: m.display_name for m in markets}
+        market_hp_max = {m.id: m.hp_max for m in markets}
+        all_stocks = {s.ticker: s for s in await stocks.get_stocks(active_only=False)}
         lines = []
         total_profit = 0
         for item in items:
             total_profit += item["profit"]
             status = "" if item["is_active"] else " [停止]"
+            st = all_stocks.get(item["ticker"])
+            if st is not None:
+                market_tag = f"[{market_names.get(st.market_id, st.market_id)}]"
+                hp_max = market_hp_max.get(st.market_id, stocks.HP_MAX)
+                hp_text = f" HP{_hp_bar(st.hp, hp_max)}"
+            else:
+                market_tag, hp_text = "", ""
             if item["profit"] > 0:
                 profit_text = f"損益+{buildAmountText(item['profit'])}"
             elif item["profit"] < 0:
@@ -436,10 +601,10 @@ class StockCog(commands.Cog):
                 rate = (item["price"] - item["avg_cost"]) / item["avg_cost"] * 100
                 profit_text += f" ({rate:+.1f}%)"
             lines.append(
-                f"`{item['ticker']}`{status}: {item['qty']}株 "
+                f"`{item['ticker']}`{market_tag}{status}: {item['qty']}株 "
                 f"(平均{buildAmountText(item['avg_cost'])} → "
                 f"現在{buildAmountText(item['price'])}) "
-                f"評価{buildAmountText(item['market'])} {profit_text}"
+                f"評価{buildAmountText(item['market'])} {profit_text}{hp_text}"
             )
         await ctx.reply(
             embed=discord.Embed(
@@ -451,27 +616,32 @@ class StockCog(commands.Cog):
         )
 
     @stock.command(name="create", brief="会社を設立します (レベルで枠増加)")
-    @app_commands.rename(ticker="銘柄", invest="投資額")
+    @app_commands.rename(ticker="銘柄", invest="投資額", market="市場")
     @app_commands.describe(
         ticker="英数字1〜15文字 (例: MYCO)",
         invest="会社への投資額 (1以上)。開始株価になり、額が多いほど好条件に",
+        market="上場する株式市場 (省略時はMEOWDAQ)",
     )
+    @app_commands.autocomplete(market=market_autocomplete)
     @commands.guild_only()
     async def stockCreateCommand(
         self,
         ctx: commands.Context,
         ticker: str,
         invest: int,
+        market: str = "MEOWDAQ",
     ):
         try:
-            stock = await stocks.create_company(ctx.author.id, ticker, invest)
+            stock = await stocks.create_company(
+                ctx.author.id, ticker, invest, market
+            )
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
         except LookupError:
             raise AmountNotEnough()
         rank = stocks.rank_for_invest(invest)
-        founder_shares = stocks.founder_shares_for(invest)
+        founder_shares = stocks.founder_shares_for(invest, rank)
         from services import levels as level_service
         from services.database import DBService
 
@@ -495,16 +665,17 @@ class StockCog(commands.Cog):
             slot_note = ""
         await ctx.reply(
             f"🏢 `{stock.ticker}` を設立しました！{slot_note}\n"
-            f"設立費用: {buildAmountText(stocks.FOUNDING_FEE + invest)}"
-            f" (手数料{buildAmountText(stocks.FOUNDING_FEE)}"
+            f"市場: {stock.market_id}／開始株価: {buildAmountText(stock.price)}\n"
+            f"設立費用: {buildAmountText(rank.fee + invest)}"
+            f" (手数料{buildAmountText(rank.fee)}"
             f"＋投資{buildAmountText(invest)})\n"
-            f"開始株価: {buildAmountText(stock.price)}"
-            f" (ランク{rank.name}: mu={stock.mu} sigma={stock.sigma}"
-            f" impact={stock.impact})\n"
-            f"創業者株 {founder_shares}株を付与 (売却のみ可・買増不可)\n"
+            f"ランク{rank.name}: 創業者株 {founder_shares}株を付与"
+            " (売却のみ可・買増不可)\n"
             "※投資額が多いほど好条件 (S: 5万〜 / A: 2万〜 / B: 5千〜 / C: 〜5千未満)\n"
+            f"※ランク{rank.name}の特典: 手数料{buildAmountText(rank.fee)}・"
+            f"配当率{rank.dividend_rate:.2%}\n"
             "※他人が自社株を売買するたび、代金の1%がロイヤリティで入ります\n"
-            "※株価が上がると、上昇分×保有株数×0.1%が配当で入ります (株を持ち続けるほどお得)\n"
+            "※値動きは市場のレンジから自動抽選されます (5分ごとに見直し)\n"
             "※自分の会社の株の買増はできません"
         )
 
@@ -540,6 +711,45 @@ class StockCog(commands.Cog):
             "※株価は変わりません (時価増資のため)"
         )
 
+    @stock.command(name="rescue", brief="経営危機の自社に追証します (HP回復)")
+    @app_commands.rename(ticker="銘柄", amount="追証額")
+    @app_commands.describe(
+        ticker="自分の会社の銘柄",
+        amount="投じる金額 (1以上)。HPが回復します",
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    @commands.guild_only()
+    async def stockRescueCommand(
+        self, ctx: commands.Context, ticker: str, amount: int
+    ):
+        try:
+            gain, new_hp, escaped = await stocks.rescue(
+                ctx.author.id, ticker, amount
+            )
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        except LookupError:
+            raise AmountNotEnough()
+        if escaped:
+            note = "✅ 経営危機から脱出しました！"
+        else:
+            stock = await stocks.get_stock(ticker.strip().upper())
+            if stock is not None:
+                market = await stocks.get_market(stock.market_id)
+                rest = (
+                    stocks.rescue_deadline_hours(stock, market)
+                    if market else 0.0
+                )
+                note = f"引き続き経営危機です (期限まで残り約{rest:.1f}h)"
+            else:
+                note = ""
+        await ctx.reply(
+            f"🛟 `{ticker.strip().upper()}` に追証しました！\n"
+            f"投じた金額: {buildAmountText(amount)}\n"
+            f"HP +{gain} → {new_hp}\n{note}"
+        )
+
     @stock.command(name="retire", brief="自分の会社を取扱停止します")
     @app_commands.rename(ticker="銘柄")
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -572,7 +782,7 @@ class StockCog(commands.Cog):
     async def stockAdmin(self, ctx: commands.Context):
         await ctx.reply(
             "サブコマンドを指定してください: "
-            "add / delist / relist / params / set-price",
+            "add / move / delist / relist / set-price",
             ephemeral=True,
         )
 
@@ -582,73 +792,29 @@ class StockCog(commands.Cog):
     @app_commands.rename(
         ticker="銘柄",
         price="開始価格",
-        mu="mu",
-        sigma="sigma",
-        preset="プリセット",
-        impact="impact",
-        mu_preset="muプリセット",
-        impact_preset="impactプリセット",
+        market="市場",
     )
     @app_commands.describe(
         ticker="英数字1〜15文字 (例: SONY)",
         price="開始価格 (1以上)",
-        mu="平均成長率 -1.0〜1.0 (省略時0)",
-        sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
-        preset="sigmaのプリセット。おまかせランダム可",
-        impact="需給感応度 0〜0.01/株 (省略時0.0005)",
-        mu_preset="muのプリセット。おまかせランダム可",
-        impact_preset="impactのプリセット。おまかせランダム可",
+        market="上場する株式市場 (省略時はMEOWDAQ)",
     )
-    @app_commands.choices(
-        preset=[
-            app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
-            app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
-            app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        mu_preset=[
-            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
-            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
-            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        impact_preset=[
-            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
-            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
-            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-    )
+    @app_commands.autocomplete(market=market_autocomplete)
     async def stockAddCommand(
         self,
         ctx: commands.Context,
         ticker: str,
         price: int,
-        mu: float | None = None,
-        sigma: float | None = None,
-        preset: app_commands.Choice[str] | None = None,
-        impact: float | None = None,
-        mu_preset: app_commands.Choice[str] | None = None,
-        impact_preset: app_commands.Choice[str] | None = None,
+        market: str = "MEOWDAQ",
     ):
         try:
-            mu_val = stocks.resolve_mu(mu, mu_preset.value if mu_preset else None)
-            sigma_val = await stocks.resolve_sigma(
-                sigma, preset.value if preset else None
-            )
-            impact_val = stocks.resolve_impact(
-                impact, impact_preset.value if impact_preset else None
-            )
-            stock = await stocks.add_ticker(
-                ticker, price, mu_val, sigma_val, impact_val
-            )
+            stock = await stocks.add_ticker(ticker, price, market)
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
         await ctx.reply(
             f"`{stock.ticker}` を上場しました: "
-            f"{buildAmountText(stock.price)} "
-            f"(mu={stock.mu} sigma={stock.sigma} impact={stock.impact})"
+            f"{buildAmountText(stock.price)} (市場{stock.market_id}・HP{stock.hp})"
         )
 
     @stockAdmin.command(name="delist", brief="※管理者専用 銘柄を取扱停止します")
@@ -695,96 +861,202 @@ class StockCog(commands.Cog):
             f"`{stock.ticker}` の価格を {buildAmountText(stock.price)} に設定しました"
         )
 
-    @stockAdmin.command(name="params", brief="※管理者専用 mu/sigma/impactを変更します")
+    @stockAdmin.command(name="move", brief="※管理者専用 銘柄の所属市場を変更します")
     @admin_only()
     @commands.guild_only()
-    @app_commands.rename(
-        ticker="銘柄",
-        mu="mu",
-        sigma="sigma",
-        impact="impact",
-        mu_preset="muプリセット",
-        impact_preset="impactプリセット",
-    )
+    @app_commands.rename(ticker="銘柄", market="市場")
+    @app_commands.describe(market="移動先の株式市場")
+    @app_commands.autocomplete(ticker=ticker_autocomplete, market=market_autocomplete)
+    async def stockMoveCommand(
+        self, ctx: commands.Context, ticker: str, market: str
+    ):
+        try:
+            stock = await stocks.move_market(ticker, market)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(
+            f"`{stock.ticker}` を市場{stock.market_id}に移動しました "
+            f"(HP{stock.hp})"
+        )
+
+
+    # ---------- /stock-market グループ ----------
+
+    @commands.hybrid_group(name="stock-market", brief="※管理者専用 株式市場を管理します")
+    @admin_only()
+    @commands.guild_only()
+    async def stockMarket(self, ctx: commands.Context):
+        await ctx.reply(
+            "サブコマンドを指定してください: create / update / delete / list",
+            ephemeral=True,
+        )
+
+    @stockMarket.command(name="list", brief="株式市場の一覧を表示します")
+    @commands.guild_only()
+    async def stockMarketListCommand(self, ctx: commands.Context):
+        markets = await stocks.get_markets()
+        if not markets:
+            await ctx.reply("市場がありません", ephemeral=True)
+            return
+        items = await stocks.get_stocks(active_only=False)
+        counts: dict[str, int] = {}
+        for s in items:
+            counts[s.market_id] = counts.get(s.market_id, 0) + 1
+        lines = [
+            f"`{m.id}` ({m.display_name}): {m.description}\n"
+            f"銘柄数{counts.get(m.id, 0)}・"
+            f"mu[{m.mu_min:g}〜{m.mu_max:g}] "
+            f"σ[{m.sigma_min:g}〜{m.sigma_max:g}] "
+            f"impact[{m.impact_min:g}〜{m.impact_max:g}]\n"
+            f"HP上限{m.hp_max}・警告{m.warning_hp}・"
+            f"追証期限{m.rescue_hours:g}h・HP0猶予{m.zero_grace_hours:g}h"
+            + (
+                f"・平均回帰(基準{m.mean_ref_price:g}, k={m.mean_k:g})"
+                if m.mean_ref_price is not None and m.mean_k is not None
+                else ""
+            )
+            for m in markets
+        ]
+        await ctx.reply(
+            embed=discord.Embed(
+                title="株式市場一覧🏛️",
+                description="\n\n".join(lines),
+                color=discord.Color.teal(),
+            )
+        )
+
+    @stockMarket.command(name="create", brief="※管理者専用 株式市場を作ります")
+    @admin_only()
+    @commands.guild_only()
+    @app_commands.rename(market_id="しじょう", name="表示名")
     @app_commands.describe(
-        mu="省略可",
-        sigma="省略可",
-        impact="省略可",
-        preset="sigmaのプリセット。おまかせランダム可",
-        mu_preset="muのプリセット。おまかせランダム可",
-        impact_preset="impactのプリセット。おまかせランダム可",
+        market_id="英数字1〜15文字 (例: MEOWDAQ)",
+        name="表示名 (省略時はIDと同じ)",
+        description="説明文",
+        mu_min="mu下限 (既定-0.001)",
+        mu_max="mu上限 (既定0.002)",
+        sigma_min="sigma下限 (既定0.02)",
+        sigma_max="sigma上限 (既定0.05)",
+        impact_min="impact下限 (既定0.0002)",
+        impact_max="impact上限 (既定0.0006)",
+        warning_hp="経営危機に入るHP (既定30)",
+        rescue_hours="追証期限h (既定24)",
     )
-    @app_commands.choices(
-        preset=[
-            app_commands.Choice(name="おとなしい (σ=0.02)", value="calm"),
-            app_commands.Choice(name="ふつう (σ=0.05)", value="normal"),
-            app_commands.Choice(name="荒い (σ=0.10)", value="wild"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        mu_preset=[
-            app_commands.Choice(name="下降トレンド (μ=-0.001)", value="down"),
-            app_commands.Choice(name="横ばい (μ=0)", value="flat"),
-            app_commands.Choice(name="上昇トレンド (μ=+0.001)", value="up"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-        impact_preset=[
-            app_commands.Choice(name="鈍感・動きにくい (0.0002)", value="dull"),
-            app_commands.Choice(name="ふつう (0.0005)", value="normal"),
-            app_commands.Choice(name="敏感・動きやすい (0.001)", value="sensitive"),
-            app_commands.Choice(name="おまかせランダム", value="random"),
-        ],
-    )
-    @app_commands.autocomplete(ticker=ticker_autocomplete)
-    async def stockParamsCommand(
+    async def stockMarketCreateCommand(
         self,
         ctx: commands.Context,
-        ticker: str,
-        mu: float | None = None,
-        sigma: float | None = None,
-        impact: float | None = None,
-        preset: app_commands.Choice[str] | None = None,
-        mu_preset: app_commands.Choice[str] | None = None,
-        impact_preset: app_commands.Choice[str] | None = None,
+        market_id: str,
+        name: str = "",
+        description: str = "",
+        mu_min: float = -0.001,
+        mu_max: float = 0.002,
+        sigma_min: float = 0.02,
+        sigma_max: float = 0.05,
+        impact_min: float = 0.0002,
+        impact_max: float = 0.0006,
+        warning_hp: int = 30,
+        rescue_hours: float = 24.0,
     ):
-        if (
-            mu is None
-            and sigma is None
-            and impact is None
-            and preset is None
-            and mu_preset is None
-            and impact_preset is None
-        ):
-            await ctx.reply(
-                "mu・sigma・impact・各プリセットのいずれかを指定してください",
-                ephemeral=True,
-            )
-            return
         try:
-            resolved_mu = None
-            if mu is not None or mu_preset is not None:
-                resolved_mu = stocks.resolve_mu(
-                    mu, mu_preset.value if mu_preset else None
+            market = await stocks.create_market(
+                stocks.Market(
+                    id=market_id,
+                    display_name=name.strip() or market_id.strip().upper(),
+                    description=description,
+                    mu_min=mu_min, mu_max=mu_max,
+                    sigma_min=sigma_min, sigma_max=sigma_max,
+                    impact_min=impact_min, impact_max=impact_max,
+                    warning_hp=warning_hp, rescue_hours=rescue_hours,
                 )
-            resolved_sigma = None
-            if preset is not None or sigma is not None:
-                resolved_sigma = await stocks.resolve_sigma(
-                    sigma, preset.value if preset else None
-                )
-            resolved_impact = None
-            if impact is not None or impact_preset is not None:
-                resolved_impact = stocks.resolve_impact(
-                    impact, impact_preset.value if impact_preset else None
-                )
-            stock = await stocks.update_params(
-                ticker, resolved_mu, resolved_sigma, resolved_impact
             )
         except ValueError as e:
             await ctx.reply(str(e), ephemeral=True)
             return
         await ctx.reply(
-            f"`{stock.ticker}` を更新: "
-            f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact}"
+            f"市場 `{market.id}` ({market.display_name}) を作りました"
         )
+
+    @stockMarket.command(name="update", brief="※管理者専用 株式市場を変更します")
+    @admin_only()
+    @commands.guild_only()
+    @app_commands.rename(market_id="しじょう")
+    @app_commands.describe(
+        market_id="変更する市場",
+        name="表示名",
+        description="説明文",
+        mu_min="mu下限", mu_max="mu上限",
+        sigma_min="sigma下限", sigma_max="sigma上限",
+        impact_min="impact下限", impact_max="impact上限",
+        jitter="銘柄ゆらぎ幅",
+        hp_max="HP上限", warning_hp="危機ラインHP",
+        dmg_per_pct="下落1%あたりのHP減",
+        recover_per_pct="上昇1%あたりのHP回復",
+        rescue_hp_per_100="100通貨あたりの回復HP",
+        rescue_hours="追証期限h",
+        zero_grace_hours="HP0の猶予h",
+    )
+    @app_commands.autocomplete(market_id=market_autocomplete)
+    async def stockMarketUpdateCommand(
+        self,
+        ctx: commands.Context,
+        market_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        mu_min: float | None = None,
+        mu_max: float | None = None,
+        sigma_min: float | None = None,
+        sigma_max: float | None = None,
+        impact_min: float | None = None,
+        impact_max: float | None = None,
+        jitter: float | None = None,
+        hp_max: int | None = None,
+        warning_hp: int | None = None,
+        dmg_per_pct: float | None = None,
+        recover_per_pct: float | None = None,
+        rescue_hp_per_100: float | None = None,
+        rescue_hours: float | None = None,
+        zero_grace_hours: float | None = None,
+    ):
+        fields: dict[str, float | int | str] = {
+            k: v for k, v in {
+                "mu_min": mu_min, "mu_max": mu_max,
+                "sigma_min": sigma_min, "sigma_max": sigma_max,
+                "impact_min": impact_min, "impact_max": impact_max,
+                "jitter": jitter, "hp_max": hp_max, "warning_hp": warning_hp,
+                "dmg_per_pct": dmg_per_pct, "recover_per_pct": recover_per_pct,
+                "rescue_hp_per_100": rescue_hp_per_100,
+                "rescue_hours": rescue_hours,
+                "zero_grace_hours": zero_grace_hours,
+            }.items() if v is not None
+        }
+        if name is not None:
+            fields["display_name"] = name
+        if description is not None:
+            fields["description"] = description
+        if not fields:
+            await ctx.reply("変更する項目を指定してください", ephemeral=True)
+            return
+        try:
+            market = await stocks.update_market(market_id, **fields)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(f"市場 `{market.id}` を更新しました")
+
+    @stockMarket.command(name="delete", brief="※管理者専用 株式市場を削除します")
+    @admin_only()
+    @commands.guild_only()
+    @app_commands.rename(market_id="しじょう")
+    @app_commands.autocomplete(market_id=market_autocomplete)
+    async def stockMarketDeleteCommand(self, ctx: commands.Context, market_id: str):
+        try:
+            mid = stocks.normalize_market_id(market_id)
+            await stocks.delete_market(mid)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(f"市場 `{mid}` を削除しました")
 
 
 async def setup(bot: commands.Bot):

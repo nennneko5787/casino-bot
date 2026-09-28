@@ -1,25 +1,19 @@
-"""株価エンジン: 幾何ランダムウォーク + 売買 + 銘柄追加 + 破産。
+"""株価エンジン: 幾何ランダムウォーク + 売買 + 銘柄追加 + HP倒産。
 
-各銘柄は独立した乱数で更新されるため、同じように上がり下がりしない。
-mu/sigma は管理者が数値で直接指定できる (原案) ほか、
-簡単プリセット (おとなしい/ふつう/荒い) で sigma を決めることもできる。
+各銘柄は所属する株式市場 (markets) を持ち、市場の値動きレンジ
+(mu/sigma/impact) の中で5分ごとにパラメータが再抽選される。
+mu/sigma/impact の個別指定はできない (create/add/paramsでの指定は廃止)。
 
-価格は整数だが、丸めは確率的 (期待値不変) にすることで
-価格1が吸着点にならないようにしている (1でも毎tick数%で脱出できる)。
-売買の需給影響も rate≠0 なら最低1は動く。
+倒産はHP制 + 追証制: 下落tickでHPが減り、上昇tickで回復する。
+HPが市場の警告ライン以下で経営危機に入り、追証 (rescue) で回復
+しなければ破産する (運営・ユーザー問わず): 保有株は紙くず・
+会社データは消去・元オーナーは再設立可。HPが警告ライン超まで
+回復すれば危機から脱出する。
 
-売買による需給影響は自律変動を主役にするため、逓減 + 上限付き。
-少量ならほぼ線形 (impact × 数量) に動くが、大量注文でも
-MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
-
-ユーザーは会社を設立できる (レベル連動枠、設立手数料1000+投資金、
-開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定、
-創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
-自社株は買増不可・売却のみ可。
-開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
-会社は破産 (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
-元オーナーは再設立可。下落が止まって1時間続くか、開始価格以上に
-回復すれば水域から脱出する。
+ユーザーは会社を設立できる (レベル連動枠、設立手数料+投資金、
+開始株価=投資金、創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
+自社株は買増不可・売却のみ可。投資額ランクは手数料・創業者株・
+配当率にのみ効き、値動きには影響しない。
 """
 
 from __future__ import annotations
@@ -52,48 +46,32 @@ MAX_PRICE = 1_000_000_000_000_000  # 1000兆
 REFERENCE_PRICE = 1000
 MEAN_REVERSION_K = 0.002
 
-# 会社設立の手数料 (消滅)。mu ボーナス等の優遇は下の INVEST_RANKS による。
+# 会社設立の手数料の既定 (ランクで割引される場合あり)。
 FOUNDING_FEE = 1000
 
-# 設立者メリット
+# 設立者メリット (既定。ランクで上乗せされる場合あり)
 ROYALTY_RATE = 0.01  # 他人が自社株を売買するたび、代金のこの割合が設立者に入る
 FOUNDER_SHARES_PER = 1000  # この投資額ごとに創業者株1株 (最低1株、売却のみ可)
 DIVIDEND_RATE = 0.001  # tickで値上がりしたら、上昇分×保有株数×この割合を配当
 
-# 破産: 開始価格割れ + 下落継続がこの時間続いたら破産。
-# 下落が止まって TREND_CALM_HOURS 続いたら危険水域から脱出する。
-BANKRUPT_DANGER_HOURS = 6
-TREND_CALM_HOURS = 1
-TREND_WINDOW = 30  # 傾向判定に使う直近履歴件数
+# HP倒産の既定値 (市場レコードがない場合のフォールバック)。
+HP_MAX = 100
+HP_WARNING = 30
+HP_DMG_PER_PCT = 3.0
+HP_RECOVER_PER_PCT = 2.0
+RESCUE_HP_PER_100 = 10.0
+RESCUE_HOURS = 24.0
+ZERO_GRACE_HOURS = 1.0
+
+# パラメータ再抽選の間隔 (tick回数。tick=1分のため5tick=5分ごと)。
+RANDOMIZE_EVERY_TICKS = 5
+
+# 既定の所属市場 (migrate/ensureでシードされる)。
+DEFAULT_MARKET_ID = "MEOWDAQ"
 
 # 1回の売買で需給により動く上限 (変動率)。自律変動 (sigma由来の
 # 数%〜十数%) より小さめにして、売買で暴落/暴騰しないようにする。
 MAX_TRADE_IMPACT = 0.03
-
-# 簡単プリセット: sigma の値のみ決める (mu は別途数値指定、省略時 0)
-VOL_PRESETS: dict[str, float] = {
-    "calm": 0.02,  # おとなしい
-    "normal": 0.05,  # ふつう
-    "wild": 0.06,  # 荒い (膨張抑制のため 0.10→0.06)
-}
-
-# mu のプリセット (平均成長率)
-MU_PRESETS: dict[str, float] = {
-    "down": -0.001,  # 下降トレンド
-    "flat": 0.0,  # 横ばい
-    "up": 0.001,  # 上昇トレンド
-}
-
-# impact のプリセット (1株あたりの変動率)
-IMPACT_PRESETS: dict[str, float] = {
-    "dull": 0.0002,  # 鈍感 (動きにくい)
-    "normal": 0.0005,  # ふつう
-    "sensitive": 0.001,  # 敏感 (動きやすい)
-}
-
-# おまかせランダム用の値域
-RANDOM_MU_RANGE = (-0.002, 0.003)
-RANDOM_IMPACTS = (0.0002, 0.0003, 0.0005, 0.0008, 0.001, 0.002)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -106,8 +84,12 @@ class Stock:
     impact: float
     is_active: bool
     owner_id: int | None = None  # None=運営銘柄、数値=ユーザー企業の設立者
-    start_price: int = 100  # 開始価格 (倒産の危険水域判定の基準)
-    floor_since: str | None = None  # 危険水域突入時刻 (水域外ではNone)
+    market_id: str = DEFAULT_MARKET_ID  # 所属市場
+    hp: int = HP_MAX  # 体力。警告ライン以下で経営危機、尽きると破産
+    crisis_since: str | None = None  # 危機突入時刻 (追証期限の基準。平常時はNone)
+    rank: str | None = None  # 設立時の投資額ランク (S/A/B/C)。運営銘柄はNone
+    start_price: int = 100  # 開始価格 (表示用。破産判定には使わない)
+    floor_since: str | None = None  # 旧制度の残骸 (未使用。読み取りのみ互換保持)
 
 
 def normalize_ticker(raw: str) -> str:
@@ -127,22 +109,32 @@ def normalize_ticker(raw: str) -> str:
     raise ValueError("tickerは英数字1〜15文字で指定してください")
 
 
-def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
+def step_price(
+    price: int,
+    mu: float,
+    sigma: float,
+    rng: random.Random,
+    ref_price: float | None = None,
+    mean_k: float | None = None,
+) -> int:
     """幾何ランダムウォークで1歩進める。下限1・上限MAX_PRICE。
 
     丸めは確率的 (stochastic rounding) にすることで期待値を保ちつつ、
     価格1が吸着点にならないようにする (1でも毎tick数%の確率で2に脱出)。
     高額帯では平均回帰で mu を下向き補正し、sigma を圧縮して膨張を抑える。
+    ref_price/mean_k 指定時は市場の平均回帰設定を使う。
     """
+    ref = ref_price if ref_price and ref_price > 0 else REFERENCE_PRICE
+    k = MEAN_REVERSION_K if mean_k is None else mean_k
     try:
         eff_mu = mu
-        if price > REFERENCE_PRICE:
-            eff_mu -= MEAN_REVERSION_K * math.log(price / REFERENCE_PRICE)
+        if price > ref:
+            eff_mu -= k * math.log(price / ref)
         # 高額帯のボラ圧縮: 10倍ごとに sigma を約1割抑える
         eff_sigma = sigma
-        if price > REFERENCE_PRICE * 10:
+        if price > ref * 10:
             eff_sigma = sigma / (
-                1.0 + 0.15 * math.log10(price / (REFERENCE_PRICE * 10))
+                1.0 + 0.15 * math.log10(price / (ref * 10))
             )
         shock = rng.gauss(0.0, 1.0)
         exact = price * math.exp(
@@ -197,27 +189,419 @@ def _row_to_stock(row) -> Stock:
         impact=row["impact"],
         is_active=bool(row["is_active"]),
         owner_id=int(owner_id) if owner_id is not None else None,
+        market_id=str(_opt("market_id") or DEFAULT_MARKET_ID),
+        hp=int(_opt("hp")) if _opt("hp") is not None else HP_MAX,
+        crisis_since=_opt("crisis_since"),
+        rank=_opt("rank"),
         start_price=int(start_price) if start_price is not None else 100,
         floor_since=_opt("floor_since"),
     )
 
 
-def danger_threshold(start_price: int) -> int:
-    """危険ライン (開始価格の50%)。開始価格1の銘柄は価格1で危機。"""
-    start = start_price if start_price > 0 else 1
-    return max(start // 2, 1)
+@dataclass(kw_only=True, slots=True)
+class Market:
+    """株式市場: 値動きレンジとHP倒産ルールの束。
 
-
-def danger_info(stock: Stock, now: datetime | None = None) -> tuple[bool, float]:
-    """危険水域の状態を返す (水域内か, 突入からの経過時間h)。
-
-    表示用 (/stock list・chart)。水域 = 危険ライン (開始価格の50%) 以下。
+    mu/sigma/impact は5分ごとにこの範囲で再抽選される。
+    jitter は銘柄固有の上乗せ幅 (muに±jitterを加える)。
     """
-    start = stock.start_price if stock.start_price > 0 else 1
-    if not stock.floor_since or stock.price > danger_threshold(start):
+
+    id: str
+    display_name: str = ""
+    description: str = ""
+    mu_min: float = -0.001
+    mu_max: float = 0.002
+    sigma_min: float = 0.02
+    sigma_max: float = 0.05
+    impact_min: float = 0.0002
+    impact_max: float = 0.0006
+    jitter: float = 0.0005
+    hp_max: int = HP_MAX
+    warning_hp: int = HP_WARNING
+    dmg_per_pct: float = HP_DMG_PER_PCT
+    recover_per_pct: float = HP_RECOVER_PER_PCT
+    rescue_hp_per_100: float = RESCUE_HP_PER_100
+    rescue_hours: float = RESCUE_HOURS
+    zero_grace_hours: float = ZERO_GRACE_HOURS
+    mean_ref_price: float | None = None
+    mean_k: float | None = None
+
+
+MARKET_ID_RE = re.compile(r"^[A-Z0-9]{1,15}$")
+
+# 初期3市場 (migrate/ensureでシードされる正本)。
+SEED_MARKETS: list[Market] = [
+    Market(
+        id="MEOWDAQ", display_name="MEOWDAQ",
+        description="メインの穏やかな市場",
+        mu_min=-0.001, mu_max=0.002,
+        sigma_min=0.02, sigma_max=0.05,
+        impact_min=0.0002, impact_max=0.0006, jitter=0.0005,
+    ),
+    Market(
+        id="AABOT", display_name="AABOT",
+        description="値動きの荒い市場",
+        mu_min=-0.002, mu_max=0.003,
+        sigma_min=0.05, sigma_max=0.10,
+        impact_min=0.0005, impact_max=0.002, jitter=0.001,
+    ),
+    Market(
+        id="OZETUDO", display_name="OZETUDO",
+        description="値動きの鈍い安定市場",
+        mu_min=-0.0005, mu_max=0.001,
+        sigma_min=0.01, sigma_max=0.03,
+        impact_min=0.0001, impact_max=0.0003, jitter=0.0002,
+    ),
+]
+
+_schema_ensured = False
+
+
+def normalize_market_id(raw: str) -> str:
+    """市場IDを正規化。不正なら ValueError。"""
+    cleaned = raw.strip().upper().strip("`'\"")
+    if MARKET_ID_RE.match(cleaned):
+        return cleaned
+    raise ValueError("市場IDは英数字1〜15文字で指定してください")
+
+
+def _row_to_market(row) -> Market:
+    def _num(key: str, default: float) -> float:
+        try:
+            v = row[key]
+        except (KeyError, IndexError):
+            return default
+        return float(v) if v is not None else default
+
+    def _int(key: str, default: int) -> int:
+        try:
+            v = row[key]
+        except (KeyError, IndexError):
+            return default
+        return int(v) if v is not None else default
+
+    def _str(key: str, default: str = "") -> str:
+        try:
+            v = row[key]
+        except (KeyError, IndexError):
+            return default
+        return str(v) if v is not None else default
+
+    try:
+        mean_ref = row["mean_ref_price"]
+    except (KeyError, IndexError):
+        mean_ref = None
+    try:
+        mean_k = row["mean_k"]
+    except (KeyError, IndexError):
+        mean_k = None
+    return Market(
+        id=row["id"],
+        display_name=row["display_name"],
+        description=_str("description"),
+        mu_min=_num("mu_min", -0.001),
+        mu_max=_num("mu_max", 0.002),
+        sigma_min=_num("sigma_min", 0.02),
+        sigma_max=_num("sigma_max", 0.05),
+        impact_min=_num("impact_min", 0.0002),
+        impact_max=_num("impact_max", 0.0006),
+        jitter=_num("jitter", 0.0),
+        hp_max=_int("hp_max", HP_MAX),
+        warning_hp=_int("warning_hp", HP_WARNING),
+        dmg_per_pct=_num("dmg_per_pct", HP_DMG_PER_PCT),
+        recover_per_pct=_num("recover_per_pct", HP_RECOVER_PER_PCT),
+        rescue_hp_per_100=_num("rescue_hp_per_100", RESCUE_HP_PER_100),
+        rescue_hours=_num("rescue_hours", RESCUE_HOURS),
+        zero_grace_hours=_num("zero_grace_hours", ZERO_GRACE_HOURS),
+        mean_ref_price=float(mean_ref) if mean_ref is not None else None,
+        mean_k=float(mean_k) if mean_k is not None else None,
+    )
+
+
+async def ensure_market_schema() -> None:
+    """markets表 + stocks拡張列の保険 (alembic未適用でも動く)。
+
+    本番DBは古いrevisionで止まっていることがあるため、
+    不足列はここで足し、初期3市場をシードする。
+    """
+    global _schema_ensured
+    if _schema_ensured:
+        return
+    await DBService.pool.execute(
+        "CREATE TABLE IF NOT EXISTS markets ("
+        "id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
+        "description TEXT NOT NULL DEFAULT '', "
+        "mu_min REAL NOT NULL DEFAULT 0, mu_max REAL NOT NULL DEFAULT 0, "
+        "sigma_min REAL NOT NULL DEFAULT 0.05, "
+        "sigma_max REAL NOT NULL DEFAULT 0.05, "
+        "impact_min REAL NOT NULL DEFAULT 0.0005, "
+        "impact_max REAL NOT NULL DEFAULT 0.0005, "
+        "jitter REAL NOT NULL DEFAULT 0, "
+        "hp_max INTEGER NOT NULL DEFAULT 100, "
+        "warning_hp INTEGER NOT NULL DEFAULT 30, "
+        "dmg_per_pct REAL NOT NULL DEFAULT 3.0, "
+        "recover_per_pct REAL NOT NULL DEFAULT 2.0, "
+        "rescue_hp_per_100 REAL NOT NULL DEFAULT 10.0, "
+        "rescue_hours REAL NOT NULL DEFAULT 24.0, "
+        "zero_grace_hours REAL NOT NULL DEFAULT 1.0, "
+        "mean_ref_price REAL NULL, mean_k REAL NULL, "
+        "updated_at TEXT NOT NULL)"
+    )
+    cursor = await DBService.pool.execute("PRAGMA table_info(stocks)")
+    cols = {r["name"] for r in await cursor.fetchall()}
+    await cursor.close()
+    if "market_id" not in cols:
+        await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN market_id TEXT NULL")
+    if "hp" not in cols:
+        await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN hp INTEGER NULL")
+    if "crisis_since" not in cols:
+        await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN crisis_since TEXT NULL")
+    if "rank" not in cols:
+        await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN rank TEXT NULL")
+    now = _now()
+    for m in SEED_MARKETS:
+        await DBService.pool.execute(
+            "INSERT OR IGNORE INTO markets "
+            "(id, display_name, description, mu_min, mu_max, sigma_min, sigma_max, "
+            "impact_min, impact_max, jitter, hp_max, warning_hp, dmg_per_pct, "
+            "recover_per_pct, rescue_hp_per_100, rescue_hours, zero_grace_hours, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (m.id, m.display_name, m.description, m.mu_min, m.mu_max,
+             m.sigma_min, m.sigma_max, m.impact_min, m.impact_max, m.jitter,
+             m.hp_max, m.warning_hp, m.dmg_per_pct, m.recover_per_pct,
+             m.rescue_hp_per_100, m.rescue_hours, m.zero_grace_hours, now),
+        )
+    await DBService.pool.execute(
+        "UPDATE stocks SET market_id = ? WHERE market_id IS NULL",
+        (DEFAULT_MARKET_ID,),
+    )
+    await DBService.pool.execute(
+        "UPDATE stocks SET hp = ? WHERE hp IS NULL", (HP_MAX,)
+    )
+    await DBService.pool.execute(
+        "UPDATE stocks SET rank = 'B' WHERE rank IS NULL"
+    )
+    await DBService.pool.commit()
+    _schema_ensured = True
+
+
+async def get_markets() -> list[Market]:
+    await ensure_market_schema()
+    cursor = await DBService.pool.execute("SELECT * FROM markets ORDER BY id")
+    rows = await cursor.fetchall()
+    await cursor.close()
+    return [_row_to_market(r) for r in rows]
+
+
+async def get_market(market_id: str) -> Market | None:
+    await ensure_market_schema()
+    market_id = normalize_market_id(market_id)
+    cursor = await DBService.pool.execute(
+        "SELECT * FROM markets WHERE id = ?", (market_id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return _row_to_market(row) if row else None
+
+
+async def require_market(market_id: str) -> Market:
+    market = await get_market(market_id)
+    if market is None:
+        raise ValueError(f"市場 {market_id.strip().upper()} は存在しません")
+    return market
+
+
+def _check_market_ranges(m: Market) -> None:
+    if m.mu_min > m.mu_max:
+        raise ValueError("mu_min は mu_max 以下にしてください")
+    if not 0.0 < m.sigma_min <= m.sigma_max <= 1.0:
+        raise ValueError("sigma は 0 < min <= max <= 1.0 にしてください")
+    if not 0.0 <= m.impact_min <= m.impact_max <= 0.01:
+        raise ValueError("impact は 0 <= min <= max <= 0.01 にしてください")
+    if m.jitter < 0.0 or m.jitter > 0.01:
+        raise ValueError("jitter は 0〜0.01 にしてください")
+    if m.hp_max < 1:
+        raise ValueError("hp_max は1以上にしてください")
+    if not 0 <= m.warning_hp < m.hp_max:
+        raise ValueError("warning_hp は 0以上hp_max未満にしてください")
+    for key in ("dmg_per_pct", "recover_per_pct", "rescue_hp_per_100"):
+        if getattr(m, key) < 0:
+            raise ValueError(f"{key} は0以上にしてください")
+    if m.rescue_hours <= 0 or m.zero_grace_hours < 0:
+        raise ValueError("rescue_hours は正、zero_grace_hours は0以上にしてください")
+    if m.mean_ref_price is not None and m.mean_ref_price <= 0:
+        raise ValueError("mean_ref_price は正にしてください")
+    if m.mean_k is not None and m.mean_k < 0:
+        raise ValueError("mean_k は0以上にしてください")
+
+
+async def create_market(m: Market) -> Market:
+    """管理者用: 株式市場を新設。ID重複・範囲不正は例外。"""
+    m.id = normalize_market_id(m.id)
+    if not m.display_name.strip():
+        raise ValueError("表示名を入力してください")
+    _check_market_ranges(m)
+    await ensure_market_schema()
+    if await get_market(m.id):
+        raise ValueError(f"市場 {m.id} は既に存在します")
+    await DBService.pool.execute(
+        "INSERT INTO markets "
+        "(id, display_name, description, mu_min, mu_max, sigma_min, sigma_max, "
+        "impact_min, impact_max, jitter, hp_max, warning_hp, dmg_per_pct, "
+        "recover_per_pct, rescue_hp_per_100, rescue_hours, zero_grace_hours, "
+        "mean_ref_price, mean_k, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (m.id, m.display_name.strip(), m.description[:500],
+         m.mu_min, m.mu_max, m.sigma_min, m.sigma_max,
+         m.impact_min, m.impact_max, m.jitter,
+         m.hp_max, m.warning_hp, m.dmg_per_pct, m.recover_per_pct,
+         m.rescue_hp_per_100, m.rescue_hours, m.zero_grace_hours,
+         m.mean_ref_price, m.mean_k, _now()),
+    )
+    await DBService.pool.commit()
+    created = await get_market(m.id)
+    assert created is not None
+    return created
+
+
+async def update_market(market_id: str, **fields) -> Market:
+    """管理者用: 市場のパラメータを部分更新。未知キー・不正値は例外。"""
+    market = await require_market(market_id)
+    allowed = {
+        "display_name", "description", "mu_min", "mu_max",
+        "sigma_min", "sigma_max", "impact_min", "impact_max", "jitter",
+        "hp_max", "warning_hp", "dmg_per_pct", "recover_per_pct",
+        "rescue_hp_per_100", "rescue_hours", "zero_grace_hours",
+        "mean_ref_price", "mean_k",
+    }
+    for key in fields:
+        if key not in allowed:
+            raise ValueError(f"更新できない項目です: {key}")
+    for key, value in fields.items():
+        setattr(market, key, value)
+    if isinstance(market.display_name, str) and not market.display_name.strip():
+        raise ValueError("表示名を入力してください")
+    _check_market_ranges(market)
+    sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
+    await DBService.pool.execute(
+        f"UPDATE markets SET {sets} WHERE id = ?",
+        (*[fields[k] for k in fields], _now(), market.id),
+    )
+    # hp_max が下がって上限超えの銘柄が出たら丸める
+    await DBService.pool.execute(
+        "UPDATE stocks SET hp = ? WHERE market_id = ? AND hp > ?",
+        (market.hp_max, market.id, market.hp_max),
+    )
+    await DBService.pool.commit()
+    updated = await get_market(market.id)
+    assert updated is not None
+    return updated
+
+
+async def delete_market(market_id: str) -> None:
+    """管理者用: 市場を削除。所属銘柄がある場合は例外 (先にmoveが必要)。"""
+    market = await require_market(market_id)
+    cursor = await DBService.pool.execute(
+        "SELECT COUNT(*) AS n FROM stocks WHERE market_id = ?", (market.id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row and int(row["n"]) > 0:
+        raise ValueError(
+            f"市場 {market.id} には銘柄が {int(row['n'])} 件あります。"
+            "先に全銘柄を他市場へ移動してください"
+        )
+    await DBService.pool.execute("DELETE FROM markets WHERE id = ?", (market.id,))
+    await DBService.pool.commit()
+
+
+async def move_market(ticker: str, market_id: str) -> Stock:
+    """銘柄の所属市場を変更する。HPは新市場の上限に丸め、危機状態は継続。"""
+    ticker = normalize_ticker(ticker)
+    market = await require_market(market_id)
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    new_hp = min(stock.hp, market.hp_max)
+    await DBService.pool.execute(
+        "UPDATE stocks SET market_id = ?, mu = ?, sigma = ?, impact = ?, "
+        "hp = ?, updated_at = ? WHERE ticker = ?",
+        (market.id, *_draw_params(market, random.Random()),
+         new_hp, _now(), ticker),
+    )
+    await DBService.pool.commit()
+    moved = await get_stock(ticker)
+    assert moved is not None
+    return moved
+
+
+def _draw_params(market: Market, rng: random.Random) -> tuple[float, float, float]:
+    """市場レンジ + 銘柄jitterで mu/sigma/impact を1組引く。"""
+    mu = rng.uniform(market.mu_min, market.mu_max)
+    mu += rng.uniform(-market.jitter, market.jitter)
+    sigma = rng.uniform(market.sigma_min, market.sigma_max)
+    impact = rng.uniform(market.impact_min, market.impact_max)
+    return (
+        round(mu, 6),
+        round(min(max(sigma, 0.0001), 1.0), 6),
+        round(min(max(impact, 0.0), 0.01), 6),
+    )
+
+
+async def randomize_params(
+    rng: random.Random | None = None,
+) -> list[Stock]:
+    """上場中銘柄の mu/sigma/impact を所属市場の範囲で再抽選する。
+
+    5分ごとの呼び出しを想定。戻り値は更新後銘柄。
+    """
+    await ensure_market_schema()
+    rng = rng or random.Random()
+    markets = {m.id: m for m in await get_markets()}
+    stocks = await get_stocks(active_only=True)
+    updated: list[Stock] = []
+    now = _now()
+    for stock in stocks:
+        market = markets.get(stock.market_id)
+        if market is None:
+            continue
+        mu, sigma, impact = _draw_params(market, rng)
+        await DBService.pool.execute(
+            "UPDATE stocks SET mu = ?, sigma = ?, impact = ?, updated_at = ? "
+            "WHERE ticker = ?",
+            (mu, sigma, impact, now, stock.ticker),
+        )
+        stock.mu, stock.sigma, stock.impact = mu, sigma, impact
+        updated.append(stock)
+    await DBService.pool.commit()
+    return updated
+
+
+def hp_after(market: Market, hp: int, old_price: int, new_price: int) -> int:
+    """1tick分のHP増減。下落で減・上昇で回復。0〜hp_maxに丸める。"""
+    if new_price == old_price or old_price < 1:
+        return max(0, min(hp, market.hp_max))
+    pct = (new_price - old_price) / old_price * 100.0
+    if pct < 0:
+        delta = pct * market.dmg_per_pct
+    else:
+        delta = pct * market.recover_per_pct
+    return max(0, min(market.hp_max, int(hp + delta)))
+
+
+def rescue_hp_for(market: Market, amount: int) -> int:
+    """追証金額 -> 回復HP。100通貨あたり rescue_hp_per_100。"""
+    return int(amount / 100 * market.rescue_hp_per_100)
+
+
+def crisis_info(
+    stock: Stock, market: Market, now: datetime | None = None
+) -> tuple[bool, float]:
+    """危機状態を返す (危機か, 突入からの経過時間h)。HPが警告超なら平常。"""
+    if stock.hp > market.warning_hp or not stock.crisis_since:
         return False, 0.0
     try:
-        since = datetime.fromisoformat(stock.floor_since)
+        since = datetime.fromisoformat(stock.crisis_since)
     except ValueError:
         return True, 0.0
     moment = now or datetime.now(UTC)
@@ -225,27 +609,15 @@ def danger_info(stock: Stock, now: datetime | None = None) -> tuple[bool, float]
     return True, hours
 
 
-def danger_remaining_hours(stock: Stock, now: datetime | None = None) -> float:
-    """倒産までの残り猶予時間h。水域外は0.0。"""
-    in_danger, elapsed = danger_info(stock, now)
-    if not in_danger:
+def rescue_deadline_hours(
+    stock: Stock, market: Market, now: datetime | None = None
+) -> float:
+    """追証期限までの残り時間h。平常時は0.0。HP0は zero_grace が優先される。"""
+    in_crisis, elapsed = crisis_info(stock, market, now)
+    if not in_crisis:
         return 0.0
-    return max(BANKRUPT_DANGER_HOURS - elapsed, 0.0)
-
-
-async def danger_declining(ticker: str, window: int = TREND_WINDOW) -> bool:
-    """直近window件が下落傾向ならTrue。前半平均→後半平均で判定。
-
-    データ不足 (4件未満) は下落継続扱い。横ばい・反発ならFalse。
-    """
-    history = await get_history(ticker, window)
-    prices = [p for _, p in history]
-    if len(prices) < 4:
-        return True
-    half = len(prices) // 2
-    older = sum(prices[:half]) / half
-    newer = sum(prices[half:]) / (len(prices) - half)
-    return newer < older
+    limit = market.zero_grace_hours if stock.hp <= 0 else market.rescue_hours
+    return max(limit - elapsed, 0.0)
 
 
 async def get_stocks(*, active_only: bool = False) -> list[Stock]:
@@ -278,7 +650,9 @@ async def get_history(ticker: str, limit: int = 100) -> list[tuple[str, int]]:
     )
     rows = await cursor.fetchall()
     await cursor.close()
-    return [(r["created_at"], r["price"]) for r in reversed(rows)]
+    ordered = list(rows)
+    ordered.reverse()
+    return [(r["created_at"], r["price"]) for r in ordered]
 
 
 async def get_currency_index(limit: int = 100) -> list[tuple[str, float]]:
@@ -373,87 +747,93 @@ async def tick_once(
 ) -> tuple[list[Stock], list[dict], list[dict], list[dict]]:
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
 
-    開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
-    会社は破産させる (運営・ユーザー問わず)。下落が止まって1時間続くか、
-    開始価格以上に回復すれば水域から脱出する。
+    HP制 + 追証制: 下落tickでHPが減り、上昇tickで回復する。
+    HPが警告ライン以下で経営危機に入り、追証期限 (市場別) までに
+    警告ライン超まで回復しなければ破産させる (運営・ユーザー問わず)。
+    HP0が猶予時間続いても破産。警告ライン超に回復すれば脱出する。
     値上がりしたユーザー企業には創業者配当を付与する。
-    戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id}],
-    危険水域突入の警告 [{ticker, owner_id, start_price, threshold, price}],
-    危険水域脱出 [{ticker, owner_id, price}])。
+    戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id, market_id}],
+    危機突入の警告 [{ticker, owner_id, market_id, hp, price, deadline_hours}],
+    危機脱出 [{ticker, owner_id, market_id, hp, price}])。
     """
+    await ensure_market_schema()
     rng = rng or random.Random()
     moment = now or datetime.now(UTC)
     now_iso = moment.isoformat()
+    markets = {m.id: m for m in await get_markets()}
     stocks = await get_stocks(active_only=True)
     updated: list[Stock] = []
     bankrupted: list[dict] = []
     warned: list[dict] = []
     escaped: list[dict] = []
     for stock in stocks:
+        market = markets.get(stock.market_id) or Market(id=stock.market_id)
         try:
             # DBに既に入っている異常値 (上限超え) はまず上限に丸めて回復させる
             if stock.price > MAX_PRICE or stock.price < 1:
                 stock.price = _clamp_price(stock.price)
             new_price = _clamp_price(
-                step_price(stock.price, stock.mu, stock.sigma, rng)
+                step_price(
+                    stock.price, stock.mu, stock.sigma, rng,
+                    market.mean_ref_price, market.mean_k,
+                )
             )
         except Exception:
             # 1銘柄の計算失敗で全体を止めない
             logger.exception("株価tickの計算に失敗 ticker=%s", stock.ticker)
             continue
-        start = stock.start_price if stock.start_price > 0 else 1
-        # 危険ライン (開始価格の50%) 以下で水域入りする
-        in_danger = new_price <= danger_threshold(start)
-        if in_danger and not stock.floor_since:
-            # 危険水域に突入: 時刻を記録して警告する
-            floor_new: str | None = now_iso
+        new_hp = hp_after(market, stock.hp, stock.price, new_price)
+        crisis_new = stock.crisis_since
+        if new_hp <= market.warning_hp and not stock.crisis_since:
+            # 経営危機に突入: 時刻を記録して警告する
+            crisis_new = now_iso
             warned.append(
                 {
                     "ticker": stock.ticker,
                     "owner_id": stock.owner_id,
-                    "start_price": start,
-                    "threshold": danger_threshold(start),
+                    "market_id": market.id,
+                    "hp": new_hp,
                     "price": new_price,
+                    "deadline_hours": (
+                        market.zero_grace_hours
+                        if new_hp <= 0 else market.rescue_hours
+                    ),
                 }
             )
-        elif not in_danger:
-            # 開始価格以上に回復: 水域から脱出
-            floor_new = None
-            if stock.floor_since:
+        elif stock.crisis_since:
+            if new_hp > market.warning_hp:
+                # 追証などで回復: 危機から脱出
+                crisis_new = None
                 escaped.append(
                     {
                         "ticker": stock.ticker,
                         "owner_id": stock.owner_id,
+                        "market_id": market.id,
+                        "hp": new_hp,
                         "price": new_price,
                     }
                 )
-        else:
-            # 水域継続: 下落が続いたまま猶予超過なら破産。
-            # 下落が止まってしばらく (TREND_CALM_HOURS) したら脱出する。
-            floor_new = stock.floor_since
-            try:
-                since = datetime.fromisoformat(stock.floor_since or "")
-            except ValueError:
-                since = moment
-            age = moment - since
-            declining = await danger_declining(stock.ticker)
-            if declining and age >= timedelta(hours=BANKRUPT_DANGER_HOURS):
-                info = await go_bankrupt(stock.ticker)
-                bankrupted.append(info)
-                continue
-            if not declining and age >= timedelta(hours=TREND_CALM_HOURS):
-                floor_new = None  # 下がり止まり → 脱出
-                escaped.append(
-                    {
-                        "ticker": stock.ticker,
-                        "owner_id": stock.owner_id,
-                        "price": new_price,
-                    }
+            else:
+                # 危機継続: 追証期限の超過で破産。
+                # HP0は短い猶予 (zero_grace_hours) が優先される。
+                try:
+                    since = datetime.fromisoformat(stock.crisis_since)
+                except ValueError:
+                    since = moment
+                age = moment - since
+                limit = (
+                    market.zero_grace_hours
+                    if new_hp <= 0 else market.rescue_hours
                 )
+                if age >= timedelta(hours=limit):
+                    info = await go_bankrupt(stock.ticker)
+                    info["market_id"] = market.id
+                    bankrupted.append(info)
+                    continue
         await DBService.pool.execute(
-            "UPDATE stocks SET price = ?, floor_since = ?, updated_at = ? "
-            "WHERE ticker = ?",
-            (new_price, floor_new, now_iso, stock.ticker),
+            "UPDATE stocks SET price = ?, hp = ?, crisis_since = ?, "
+            "updated_at = ? WHERE ticker = ?",
+            (new_price, new_hp, crisis_new, now_iso, stock.ticker),
         )
         await DBService.pool.execute(
             "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
@@ -467,7 +847,8 @@ async def tick_once(
         )
         gain = new_price - stock.price
         stock.price = new_price
-        stock.floor_since = floor_new
+        stock.hp = new_hp
+        stock.crisis_since = crisis_new
         updated.append(stock)
         if gain > 0 and stock.owner_id is not None:
             # 創業者配当。失敗してもtick全体は止めない。
@@ -527,30 +908,31 @@ async def go_bankrupt(ticker: str) -> dict:
 async def add_ticker(
     ticker: str,
     price: int,
-    mu: float = 0.0,
-    sigma: float = 0.05,
-    impact: float = 0.0005,
+    market_id: str = DEFAULT_MARKET_ID,
 ) -> Stock:
-    """管理者用: 新規銘柄を追加。重複・不正値は例外。"""
+    """管理者用: 新規銘柄を追加。重複・不正値は例外。
+
+    mu/sigma/impact は所属市場のレンジから自動抽選される (指定不可)。
+    HPは満タンで開始する。
+    """
+    await ensure_market_schema()
     ticker = normalize_ticker(ticker)
+    market = await require_market(market_id)
     if price < 1:
         raise ValueError("開始価格は1以上にしてください")
     if price > MAX_PRICE:
         raise ValueError(f"開始価格は{MAX_PRICE:,}以下にしてください")
-    if not -1.0 <= mu <= 1.0:
-        raise ValueError("muは-1.0〜1.0の範囲で指定してください")
-    if not 0.0 < sigma <= 1.0:
-        raise ValueError("sigmaは0より大きく1.0以下で指定してください")
-    check_impact(impact)
     if await get_stock(ticker):
         raise ValueError(f"{ticker} は既に存在します")
+    mu, sigma, impact = _draw_params(market, random.Random())
     now = _now()
     await DBService.pool.execute(
         "INSERT INTO stocks "
         "(ticker, display_name, price, mu, sigma, impact, is_active, "
-        "start_price, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
-        (ticker, ticker, price, mu, sigma, impact, price, now),
+        "market_id, hp, crisis_since, rank, start_price, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL, ?, ?)",
+        (ticker, ticker, price, mu, sigma, impact,
+         market.id, market.hp_max, price, now),
     )
     await DBService.pool.execute(
         "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
@@ -588,7 +970,11 @@ async def set_active_own(user_id: int, ticker: str, active: bool) -> Stock:
 
 
 async def set_price(ticker: str, price: int) -> Stock:
-    """管理者用: 価格を直接設定 (価格1張り付き等の救済用)。履歴にも点を打つ。"""
+    """管理者用: 価格を直接設定 (救済用)。履歴にも点を打つ。
+
+    HPも満タンに戻し、危機状態を解除する。
+    """
+    await ensure_market_schema()
     ticker = normalize_ticker(ticker)
     if price < 1:
         raise ValueError("価格は1以上にしてください")
@@ -597,42 +983,44 @@ async def set_price(ticker: str, price: int) -> Stock:
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
+    market = await get_market(stock.market_id)
+    full_hp = market.hp_max if market else HP_MAX
     now = _now()
     await DBService.pool.execute(
-        "UPDATE stocks SET price = ?, floor_since = NULL, updated_at = ? "
-        "WHERE ticker = ?",
-        (price, now, ticker),
+        "UPDATE stocks SET price = ?, hp = ?, crisis_since = NULL, "
+        "floor_since = NULL, updated_at = ? WHERE ticker = ?",
+        (price, full_hp, now, ticker),
     )
     await DBService.pool.execute(
         "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
         (ticker, price, now),
     )
     await DBService.pool.commit()
-    stock.price = price
+    stock = await get_stock(ticker)
+    assert stock is not None
     return stock
-
-
-def founding_bonus_mu(invest: int) -> float:
-    """投資額に応じた mu ボーナス。ランク表が正本。"""
-    return rank_for_invest(invest).mu_bonus
 
 
 @dataclass(frozen=True, slots=True)
 class InvestRank:
-    """会社設立時の投資額ランク。投資が多いほど優遇される。"""
+    """会社設立時の投資額ランク。投資が多いほど優遇される。
+
+    効果は手数料・創業者株・配当率のみ。値動き (mu/sigma/impact) には
+    影響しない (値動きは所属市場のレンジから自動抽選)。
+    """
 
     name: str
-    mu_bonus: float
-    sigma: float
-    impact: float
+    fee: int  # 設立手数料
+    founder_per: int  # この投資額ごとに創業者株1株
+    dividend_rate: float  # 値上がり配当の割合
 
 
 # (下限, ランク)。上から順に判定する。
 INVEST_RANKS: list[tuple[int, InvestRank]] = [
-    (50000, InvestRank("S", 0.003, 0.03, 0.0003)),
-    (20000, InvestRank("A", 0.002, 0.04, 0.0005)),
-    (5000, InvestRank("B", 0.001, 0.05, 0.0008)),
-    (1, InvestRank("C", 0.0, 0.06, 0.001)),
+    (50000, InvestRank("S", 500, 500, 0.002)),
+    (20000, InvestRank("A", 800, 800, 0.0015)),
+    (5000, InvestRank("B", 1000, 1000, 0.001)),
+    (1, InvestRank("C", 1000, 1500, 0.0005)),
 ]
 
 
@@ -644,9 +1032,18 @@ def rank_for_invest(invest: int) -> InvestRank:
     return INVEST_RANKS[-1][1]
 
 
-def founder_shares_for(invest: int) -> int:
-    """投資額に応じた創業者株数。1000ごとに1株、最低1株。"""
-    return max(invest // FOUNDER_SHARES_PER, 1)
+def dividend_for_rank(rank_name: str | None) -> float:
+    """ランク名に対応する配当率。未知・Noneは既定値。"""
+    for _, rank in INVEST_RANKS:
+        if rank.name == rank_name:
+            return rank.dividend_rate
+    return DIVIDEND_RATE
+
+
+def founder_shares_for(invest: int, rank: InvestRank | None = None) -> int:
+    """投資額とランクに応じた創業者株数。最低1株。"""
+    per = rank.founder_per if rank else FOUNDER_SHARES_PER
+    return max(invest // per, 1)
 
 
 # レベル連動の会社保有枠: 10Lvごとに+1社 (Lv1〜9:1社、Lv10〜19:2社…)、上限5社。
@@ -707,7 +1104,7 @@ async def _add_user_amount(user_id: int, amount: int) -> None:
 
 
 async def _grant_founder_dividend(stock: Stock, gain: int) -> int:
-    """創業者配当: 値上がり分×設立者の保有株数×DIVIDEND_RATEを付与。
+    """創業者配当: 値上がり分×設立者の保有株数×ランク配当率を付与。
 
     株を持ち続けるほど配当が増える (売ると将来の配当が減る)。
     戻り値は付与額。値下がり・保有なし・運営銘柄は0。
@@ -722,7 +1119,8 @@ async def _grant_founder_dividend(stock: Stock, gain: int) -> int:
     await cursor.close()
     if not row or row["qty"] < 1:
         return 0
-    dividend = min(int(gain * row["qty"] * DIVIDEND_RATE), SQLITE_MAX_INT)
+    rate = dividend_for_rank(stock.rank)
+    dividend = min(int(gain * row["qty"] * rate), SQLITE_MAX_INT)
     if dividend < 1:
         return 0
     await _add_user_amount(stock.owner_id, dividend)
@@ -733,18 +1131,21 @@ async def create_company(
     user_id: int,
     ticker: str,
     invest: int,
+    market_id: str = DEFAULT_MARKET_ID,
 ) -> Stock:
-    """ユーザー用: 会社を設立 (レベル連動枠)。設立手数料1000+投資金を徴収。
+    """ユーザー用: 会社を設立 (レベル連動枠)。
 
-    開始株価=投資金。mu/sigma/impactは投資額ランクで自動決定され、
-    指定はできない (管理者の add/params のみ数値・プリセット指定可)。
-    設立者には投資額1000ごとに1株 (最低1株) の創業者株を付与する。
+    設立手数料 (ランクで割引) +投資金を徴収。開始株価=投資金。
+    mu/sigma/impact は所属市場のレンジから自動抽選され、指定はできない。
+    設立者にはランクに応じた創業者株を付与する。
     戻り値は設立した銘柄。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     """
     from services import levels as level_service
 
+    await ensure_market_schema()
     ticker = normalize_ticker(ticker)
+    market = await require_market(market_id)
     if invest < 1:
         raise ValueError("投資額は1以上にしてください")
     if invest > MAX_PRICE:
@@ -765,7 +1166,8 @@ async def create_company(
         nxt = next_slot_level(user_level)
         extra = f" (Lv.{nxt}で次の枠が解放されます)" if nxt else " (上限です)"
         raise ValueError(f"Lv.{user_level}では会社は{limit}社までです{extra}")
-    cost = FOUNDING_FEE + invest
+    rank = rank_for_invest(invest)
+    cost = rank.fee + invest
     cursor = await DBService.pool.execute(
         "SELECT * FROM users WHERE id = ?", (user_id,)
     )
@@ -779,10 +1181,7 @@ async def create_company(
         balance = row["amount"]
     if balance < cost:
         raise LookupError(f"残高不足: 必要 {cost}")
-    rank = rank_for_invest(invest)
-    mu = min(rank.mu_bonus, 1.0)
-    sigma = rank.sigma
-    impact = rank.impact
+    mu, sigma, impact = _draw_params(market, random.Random())
     now = _now()
     await DBService.pool.execute(
         "UPDATE users SET amount = amount - ? WHERE id = ?", (cost, user_id)
@@ -790,8 +1189,10 @@ async def create_company(
     await DBService.pool.execute(
         "INSERT INTO stocks "
         "(ticker, display_name, price, mu, sigma, impact, is_active, "
-        "owner_id, start_price, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
-        (ticker, ticker, invest, mu, sigma, impact, user_id, invest, now),
+        "owner_id, market_id, hp, crisis_since, rank, start_price, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?)",
+        (ticker, ticker, invest, mu, sigma, impact, user_id,
+         market.id, market.hp_max, rank.name, invest, now),
     )
     await DBService.pool.execute(
         "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
@@ -799,7 +1200,7 @@ async def create_company(
     )
     await DBService.pool.execute(
         "INSERT INTO holdings (user_id, ticker, qty, avg_cost) VALUES (?, ?, ?, ?)",
-        (user_id, ticker, founder_shares_for(invest), invest),
+        (user_id, ticker, founder_shares_for(invest, rank), invest),
     )
     await DBService.pool.commit()
     stock = await get_stock(ticker)
@@ -881,91 +1282,54 @@ async def add_investment(
     return stock, new_shares
 
 
-async def update_params(
-    ticker: str,
-    mu: float | None = None,
-    sigma: float | None = None,
-    impact: float | None = None,
-) -> Stock:
+async def rescue(user_id: int, ticker: str, amount: int) -> tuple[int, int, bool]:
+    """追証: 設立者が資金を投じて危機の銘柄のHPを回復する。
+
+    戻り値は (回復HP, 回復後HP, 危機脱出したか)。
+    危機でない銘柄・他人の会社・金額不正は ValueError。
+    残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
+    """
+    await ensure_market_schema()
     ticker = normalize_ticker(ticker)
+    if amount < 1:
+        raise ValueError("追証額は1以上にしてください")
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
-    if mu is not None:
-        if not -1.0 <= mu <= 1.0:
-            raise ValueError("muは-1.0〜1.0の範囲で指定してください")
-        stock.mu = mu
-    if sigma is not None:
-        if not 0.0 < sigma <= 1.0:
-            raise ValueError("sigmaは0より大きく1.0以下で指定してください")
-        stock.sigma = sigma
-    if impact is not None:
-        stock.impact = check_impact(impact)
+    if stock.owner_id != user_id:
+        raise ValueError(f"{ticker} はあなたの会社ではありません")
+    market = await require_market(stock.market_id)
+    in_crisis, _ = crisis_info(stock, market)
+    if not in_crisis:
+        raise ValueError(f"{ticker} は経営危機ではありません (HP {stock.hp})")
+    cursor = await DBService.pool.execute(
+        "SELECT amount FROM users WHERE id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    balance = 100 if row is None else row["amount"]
+    if row is None:
+        await DBService.pool.execute("INSERT INTO users(id) VALUES (?)", (user_id,))
+    if balance < amount:
+        raise LookupError(f"残高不足: 必要 {amount}")
+    gain = rescue_hp_for(market, amount)
+    if gain < 1:
+        raise ValueError(
+            f"追証額が少なすぎます (この市場は100通貨あたり"
+            f"{market.rescue_hp_per_100:g}HP回復)"
+        )
+    new_hp = min(stock.hp + gain, market.hp_max)
+    escaped = new_hp > market.warning_hp
     await DBService.pool.execute(
-        "UPDATE stocks SET mu = ?, sigma = ?, impact = ?, updated_at = ? "
+        "UPDATE users SET amount = amount - ? WHERE id = ?", (amount, user_id)
+    )
+    await DBService.pool.execute(
+        "UPDATE stocks SET hp = ?, crisis_since = ?, updated_at = ? "
         "WHERE ticker = ?",
-        (stock.mu, stock.sigma, stock.impact, _now(), ticker),
+        (new_hp, None if escaped else stock.crisis_since, _now(), ticker),
     )
     await DBService.pool.commit()
-    return stock
-
-
-async def resolve_sigma(sigma: float | None, preset: str | None) -> float:
-    """簡単プリセットと数値指定の解決。preset優先、どちらも無ければ既定0.05。
-
-    preset="random" の場合は3段階からランダムに選ぶ。
-    """
-    if preset is not None:
-        if preset == "random":
-            return random.Random().choice(list(VOL_PRESETS.values()))
-        if preset not in VOL_PRESETS:
-            raise ValueError("presetは calm/normal/wild/random から選んでください")
-        return VOL_PRESETS[preset]
-    if sigma is not None:
-        if not 0.0 < sigma <= 1.0:
-            raise ValueError("sigmaは0より大きく1.0以下で指定してください")
-        return sigma
-    return VOL_PRESETS["normal"]
-
-
-def resolve_mu(
-    mu: float | None, mu_preset: str | None, rng: random.Random | None = None
-) -> float:
-    """mu の数値指定とプリセットの解決。プリセット優先、どちらも無ければ既定0。
-
-    mu_preset="random" の場合は -0.002〜+0.003 の一様乱数。
-    """
-    if mu_preset is not None:
-        if mu_preset == "random":
-            return round((rng or random.Random()).uniform(*RANDOM_MU_RANGE), 6)
-        if mu_preset not in MU_PRESETS:
-            raise ValueError("muのプリセットは down/flat/up/random から選んでください")
-        return MU_PRESETS[mu_preset]
-    if mu is not None:
-        if not -1.0 <= mu <= 1.0:
-            raise ValueError("muは-1.0〜1.0の範囲で指定してください")
-        return mu
-    return 0.0
-
-
-def resolve_impact(
-    impact: float | None, impact_preset: str | None, rng: random.Random | None = None
-) -> float:
-    """impact の数値指定とプリセットの解決。プリセット優先、どちらも無ければ既定。
-
-    impact_preset="random" の場合は候補値からランダムに選ぶ。
-    """
-    if impact_preset is not None:
-        if impact_preset == "random":
-            return (rng or random.Random()).choice(RANDOM_IMPACTS)
-        if impact_preset not in IMPACT_PRESETS:
-            raise ValueError(
-                "impactのプリセットは dull/normal/sensitive/random から選んでください"
-            )
-        return IMPACT_PRESETS[impact_preset]
-    if impact is not None:
-        return check_impact(impact)
-    return 0.0005
+    return gain, new_hp, escaped
 
 
 async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float, int]:

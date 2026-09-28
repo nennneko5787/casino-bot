@@ -3,11 +3,14 @@
 料金は市場価値(通貨指数)連動の固定式で、不足時はエラー。
 メンションで呼び出し (リプライのみでは反応しない)、ユーザー毎に履歴保持・削除可。
 system指示は管理者既定 + ユーザー別persona。
+メンション反応は envのai_channel で指定されたチャンネル (とそのスレッド) のみ。
+未設定時は全チャンネルで反応する。スラッシュコマンドは制限対象外。
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 
 import discord
@@ -23,6 +26,24 @@ from services.message import buildAmountText
 logger = logging.getLogger(__name__)
 
 
+def _ai_channel_id() -> int | None:
+    """envのai_channelをint化。未設定・不正値はNone (全chで反応)。"""
+    raw = os.environ.get("ai_channel", "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _in_ai_channel(message: discord.Message) -> bool:
+    """AIチャット対象チャンネルか。スレッド内は親チャンネルで判定する。"""
+    allowed = _ai_channel_id()
+    if allowed is None:
+        return True
+    channel = message.channel
+    if channel.id == allowed:
+        return True
+    parent = getattr(channel, "parent", None)
+    return parent is not None and parent.id == allowed
+
+
 def _chunks(text: str, limit: int = 1900) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)] or ["(空の応答)"]
 
@@ -35,7 +56,7 @@ class AiCog(commands.Cog):
         with suppress(Exception):
             await ai.ensure_tables()
 
-    async def _run(self, user_id: int, text: str) -> str:
+    async def _run(self, user_id: int, text: str) -> tuple[str, bool]:
         price, _ = await ai.current_price()
         try:
             await ai.charge(user_id, price)
@@ -73,14 +94,15 @@ class AiCog(commands.Cog):
             return
         price, index = await ai.current_price()
         try:
-            reply = await self._run(ctx.author.id, text)
+            reply, fallback = await self._run(ctx.author.id, text)
         except AmountNotEnough:
             raise
         except ValueError as e:
             await ctx.reply(f"{e}\n-# 料金は返金されました", ephemeral=True)
             return
+        note = " (代替モデルで応答)" if fallback else ""
         await ctx.reply(
-            f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動)"
+            f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動){note}"
         )
 
     @ai.command(name="price", brief="AIチャットの現在料金を表示します")
@@ -179,6 +201,9 @@ class AiCog(commands.Cog):
         # メンション必須。リプライのみ (メンションなし) では反応しない。
         if bot_user not in message.mentions:
             return
+        # envで指定されたチャンネル (ai_channel) 以外では反応しない。
+        if not _in_ai_channel(message):
+            return
         # コマンド本文の除去
         text = message.content
         for m in message.mentions:
@@ -194,13 +219,15 @@ class AiCog(commands.Cog):
         price, _ = await ai.current_price()
         async with message.channel.typing():
             try:
-                reply = await self._run(message.author.id, text)
+                reply, fallback = await self._run(message.author.id, text)
             except AmountNotEnough:
                 await message.reply(f"{buildAmountText(0)}が足りません…もとい残高が足りません (料金: {buildAmountText(price)})")
                 return
             except ValueError as e:
                 await message.reply(f"{e}\n-# 料金は返金されました")
                 return
+        if fallback:
+            reply = f"{reply}\n-# 代替モデルで応答しました"
         await self._reply_long(message, reply)
 
 
