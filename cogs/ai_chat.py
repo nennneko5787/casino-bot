@@ -179,16 +179,15 @@ class AiCog(commands.Cog):
             await message.reply(f"速すぎるよ！あと{retry:.1f}秒待ってね")
             return
         price, _ = await ai.current_price()
-        try:
-            reply = await self._run(message.author.id, text)
-        except AmountNotEnough:
-            await message.reply(f"{buildAmountText(0)}が足りません…もとい残高が足りません (料金: {buildAmountText(price)})")
-            return
-        except ValueError as e:
-            await message.reply(f"{e}\n-# 料金は返金されました")
-            return
         async with message.channel.typing():
-            pass
+            try:
+                reply = await self._run(message.author.id, text)
+            except AmountNotEnough:
+                await message.reply(f"{buildAmountText(0)}が足りません…もとい残高が足りません (料金: {buildAmountText(price)})")
+                return
+            except ValueError as e:
+                await message.reply(f"{e}\n-# 料金は返金されました")
+                return
         await self._reply_long(message, reply)
 
 
