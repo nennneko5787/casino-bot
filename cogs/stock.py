@@ -7,7 +7,9 @@
 mu/sigma/impactは投資額ランクで自動決定、
 創業者株+売買ロイヤリティ+値上がり配当あり)。
 自社株は買増不可・売却のみ可。
-価格1が24時間続いた会社は破産 (保有株は紙くず・会社消去)。
+開始価格割れ + 下落継続で危険水域に入り、下落したまま6時間続いた会社は
+破産 (保有株は紙くず・会社消去)。下落が止まって1時間続くか、
+開始価格以上に回復すれば脱出。
 """
 
 import asyncio
@@ -67,25 +69,36 @@ class StockCog(commands.Cog):
     async def cog_unload(self):
         self.tick_loop.cancel()
 
+    async def _broadcast(self, msg: str):
+        for guild in self.bot.guilds:
+            with suppress(Exception):
+                ch = self._notify_channel(guild)
+                if ch is not None:
+                    await ch.send(msg)
+
     @tasks.loop(minutes=TICK_INTERVAL_MINUTES)
     async def tick_loop(self):
         try:
-            _, bankrupted = await stocks.tick_once()
+            _, bankrupted, warned = await stocks.tick_once()
         except Exception:
             logger.exception("株価の定期更新に失敗")
             return
+        for info in warned:
+            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
+            await self._broadcast(
+                f"⚠️ `{info['ticker']}` が倒産危機です"
+                f"（開始{buildAmountText(info['start_price'])}→現在"
+                f"{buildAmountText(info['price'])}）\n"
+                f"設立者: {owner}／下落が{stocks.BANKRUPT_DANGER_HOURS}時間続けば破産、"
+                "止まれば脱出します"
+            )
         for info in bankrupted:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
-            msg = (
+            await self._broadcast(
                 f"💸 `{info['ticker']}` が破産しました"
-                f"（価格1が{stocks.BANKRUPT_FLOOR_HOURS}時間継続）\n"
+                f"（開始価格割れが{stocks.BANKRUPT_DANGER_HOURS}時間継続）\n"
                 f"設立者: {owner}／保有株は紙くずになりました"
             )
-            for guild in self.bot.guilds:
-                with suppress(Exception):
-                    ch = self._notify_channel(guild)
-                    if ch is not None:
-                        await ch.send(msg)
 
     @tick_loop.before_loop
     async def _before_tick(self):
@@ -130,8 +143,10 @@ class StockCog(commands.Cog):
                 mark = ""
             status = "" if s.is_active else " [取扱停止]"
             owner = f" [U:<@{s.owner_id}>]" if s.owner_id is not None else ""
+            in_danger, elapsed = stocks.danger_info(s)
+            danger = f" ⚠️危険水域({elapsed:.1f}h経過)" if in_danger else ""
             lines.append(
-                f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{owner}"
+                f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{danger}{owner}"
             )
         desc = "\n".join(lines) if lines else "銘柄がありません"
         await ctx.reply(
@@ -307,12 +322,26 @@ class StockCog(commands.Cog):
         history = await stocks.get_history(name, count)
         buf = await asyncio.to_thread(render_stock_chart, history, name, amountName)
         file = discord.File(buf, filename=CHART_NAME)
+        in_danger, elapsed = stocks.danger_info(stock)
+        if in_danger:
+            rest = stocks.danger_remaining_hours(stock)
+            danger_note = (
+                f"\n⚠️倒産危機: 開始{buildAmountText(stock.start_price)}"
+                f"→現在{buildAmountText(stock.price)}"
+                f" ({elapsed:.1f}h経過・残り約{rest:.1f}h)"
+            )
+        else:
+            danger_note = (
+                f"\n開始価格: {buildAmountText(stock.start_price)}"
+                " (割れると倒産危機)"
+            )
         embed = discord.Embed(
             title=f"{name} チャート📈",
             description=(
                 f"現在値: {buildAmountText(stock.price)}\n"
                 f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact:.4f}/株"
                 + ("" if stock.is_active else "\n※取扱停止中")
+                + danger_note
             ),
             color=discord.Color.blue(),
         )
