@@ -14,6 +14,7 @@ mu/sigma/impactは投資額ランクで自動決定、
 
 import asyncio
 import logging
+import os
 from contextlib import suppress
 
 import discord
@@ -69,10 +70,25 @@ class StockCog(commands.Cog):
     async def cog_unload(self):
         self.tick_loop.cancel()
 
+    async def _log_channel(
+        self, guild: discord.Guild | None
+    ) -> discord.abc.Messageable | None:
+        """倒産関連通知先。envのlog_channel優先、なければ従来の通知先。"""
+        if guild is not None:
+            raw = os.environ.get("log_channel", "").strip()
+            if raw.isdigit():
+                ch = guild.get_channel(int(raw))
+                if ch is None:
+                    with suppress(discord.DiscordException):
+                        ch = await guild.fetch_channel(int(raw))
+                if isinstance(ch, discord.abc.Messageable):
+                    return ch
+        return self._notify_channel(guild)
+
     async def _broadcast(self, msg: str):
         for guild in self.bot.guilds:
             with suppress(Exception):
-                ch = self._notify_channel(guild)
+                ch = await self._log_channel(guild)
                 if ch is not None:
                     await ch.send(msg)
 
