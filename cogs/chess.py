@@ -67,6 +67,22 @@ class ChessPickButton(discord.ui.Button):
         await view.pick(interaction, self.idx)
 
 
+class ChessPageButton(discord.ui.Button):
+    def __init__(self, label: str, delta: int, disabled: bool):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary,
+            row=4,
+            disabled=disabled,
+        )
+        self.delta = delta
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        assert isinstance(view, ChessGameView)
+        await view.flip_page(interaction, self.delta)
+
+
 class ChessCancelButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="キャンセル", style=discord.ButtonStyle.primary, row=4)
@@ -161,15 +177,29 @@ class ChessGameView(discord.ui.View):
 
     @property
     def page_count(self) -> int:
-        return max(1, (len(self._options()) + MOVES_PER_PAGE - 1) // MOVES_PER_PAGE)
+        return max(1, (len(self._page_items()) + MOVES_PER_PAGE - 1) // MOVES_PER_PAGE)
+
+    def _page_items(self) -> list:
+        """ページング対象の一覧。piece=駒マス / dest=移動先グループ(to毎)。"""
+        game = self._game()
+        if not game:
+            return []
+        if self.phase == "piece":
+            return self._options()
+        return self._dest_groups()
 
     def _build(self):
-        opts = self._options()
+        items = self._page_items()
         self.page = min(self.page, self.page_count - 1)
-        page_opts = opts[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
-        for i, _ in enumerate(page_opts):
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
+        for i, _ in enumerate(page_items):
             idx = self.page * MOVES_PER_PAGE + i
-            self.add_item(ChessPickButton(move_letter(idx), idx, row=i // 5))
+            self.add_item(ChessPickButton(move_letter(i), idx, row=i // 5))
+        if self.page_count > 1:
+            self.add_item(ChessPageButton("◀", -1, disabled=self.page == 0))
+            self.add_item(
+                ChessPageButton("▶", 1, disabled=self.page >= self.page_count - 1)
+            )
         if self.phase == "dest":
             self.add_item(ChessCancelButton())
         self.add_item(ChessResignButton())
@@ -178,11 +208,11 @@ class ChessGameView(discord.ui.View):
         game = self._game()
         if not game:
             return {}
+        items = self._page_items()
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
         marks = {}
-        for i, opt in enumerate(self._options()):
-            if i >= 26:
-                break
-            sq = opt if self.phase == "piece" else opt["to"]
+        for i, opt in enumerate(page_items):
+            sq = opt if self.phase == "piece" else opt[0]["to"]
             marks[sq] = chr(ord("a") + i)
         return marks
 
@@ -191,19 +221,13 @@ class ChessGameView(discord.ui.View):
         if not game:
             return []
         board = game["state"]["board"]
+        items = self._page_items()
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
         if self.phase == "piece":
-            return [f"{sq_name(r, c)}{piece_name(board, r, c)}" for r, c in self._options()]
-        labels = []
-        for m in self._options():
-            to = sq_name(*m["to"])
-            extra = "(昇格先を選択)" if m.get("promo") else ""
-            labels.append(f"{to}へ{extra}")
-        # 同じ to の promo 違いは1行にまとめる
-        seen: list[str] = []
-        for lab in labels:
-            if lab not in seen:
-                seen.append(lab)
-        return seen
+            return [f"{sq_name(r, c)}{piece_name(board, r, c)}" for r, c in page_items]
+        return [f"{sq_name(*g[0]['to'])}へ"
+                + ("(昇格先を選択)" if g[0].get("promo") else "")
+                for g in page_items]
 
     def _dest_groups(self) -> list[list]:
         """to ごとに moves をまとめた一覧 (表示順)。"""
@@ -216,6 +240,23 @@ class ChessGameView(discord.ui.View):
             else:
                 groups.append([m])
         return groups
+
+    async def flip_page(self, interaction: discord.Interaction, delta: int):
+        game = self._game()
+        if not game or not await self.cog.check_turn(interaction, game):
+            return
+        await interaction.response.defer()
+        message = interaction.message
+        assert message is not None
+        if self.cog._expired(game):
+            await self.cog.settle(message, game, self.game_id, winner_side=None)
+            return
+        view = ChessGameView(
+            self.cog, self.game_id, phase=self.phase, sel=self.sel,
+            page=self.page + delta, notice=self.notice,
+        )
+        view.message = message
+        await self.cog.show_board(message, game, self.game_id, view, notice=view.notice)
 
     async def pick(self, interaction: discord.Interaction, idx: int):
         game = self._game()
@@ -552,11 +593,12 @@ class ChessCog(commands.Cog):
         return embed
 
     def _options_text(self, view: ChessGameView) -> str:
-        labels = view.option_labels() if view.phase == "piece" else [f"{sq_name(*g[0]['to'])}へ" for g in view._dest_groups()]
+        labels = view.option_labels()
         lines = []
-        for i, lab in enumerate(labels[view.page * MOVES_PER_PAGE:(view.page + 1) * MOVES_PER_PAGE]):
-            idx = view.page * MOVES_PER_PAGE + i
-            lines.append(f"{move_letter(idx)}: {lab}")
+        for i, lab in enumerate(labels):
+            lines.append(f"{move_letter(i)}: {lab}")
+        if view.page_count > 1:
+            lines.append(f"(p.{view.page + 1}/{view.page_count} ◀▶で切替)")
         return "\n".join(lines) if lines else "選択肢がありません"
 
     async def show_board(self, message: discord.Message, game: dict, gid: int, view: ChessGameView, notice: str = ""):

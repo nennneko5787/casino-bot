@@ -1,0 +1,14 @@
+DejaVuSans.ttf bundled in this directory is used to render chess piece
+glyphs (U+265A-U+265F), which the IPAex font does not contain.
+
+DejaVu Sans originates from the DejaVu fonts project, derived from
+Bitstream Vera Sans under the Bitstream Vera Fonts Copyright, with
+additional glyphs under the Arev Fonts Copyright. Both licenses are
+permissive: the font may be freely used, copied, merged, modified and
+redistributed (including bundled with software), provided the copyright
+and trademark notices are preserved. See:
+https://dejavu-fonts.github.io/License.html
+
+Source of this copy: matplotlib's bundled fonts
+(.venv/Lib/site-packages/matplotlib/mpl-data/fonts/ttf/DejaVuSans.ttf).
+Full license text ships with matplotlib; this note records provenance.

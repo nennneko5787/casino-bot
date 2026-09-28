@@ -73,6 +73,22 @@ class ShogiPickButton(discord.ui.Button):
         await view.pick(interaction, self.idx)
 
 
+class ShogiPageButton(discord.ui.Button):
+    def __init__(self, label: str, delta: int, disabled: bool):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary,
+            row=4,
+            disabled=disabled,
+        )
+        self.delta = delta
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        assert isinstance(view, ShogiGameView)
+        await view.flip_page(interaction, self.delta)
+
+
 class ShogiCancelButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="キャンセル", style=discord.ButtonStyle.primary, row=4)
@@ -178,15 +194,41 @@ class ShogiGameView(discord.ui.View):
 
     @property
     def page_count(self) -> int:
-        return max(1, (len(self._options()) + MOVES_PER_PAGE - 1) // MOVES_PER_PAGE)
+        return max(1, (len(self._page_items()) + MOVES_PER_PAGE - 1) // MOVES_PER_PAGE)
+
+    def _page_items(self) -> list:
+        """ページング対象の一覧。piece=駒選択肢 / dest=移動先グループ(to毎)。"""
+        game = self._game()
+        if not game:
+            return []
+        if self.phase == "piece":
+            return self._options()
+        return self._dest_groups()
+
+    def _dest_groups(self) -> list[list]:
+        """to ごとに moves をまとめた一覧 (表示順)。"""
+        groups: list[list] = []
+        for m in self._options():
+            for g in groups:
+                if g[0]["to"] == m["to"]:
+                    g.append(m)
+                    break
+            else:
+                groups.append([m])
+        return groups
 
     def _build(self):
-        opts = self._options()
+        items = self._page_items()
         self.page = min(self.page, self.page_count - 1)
-        page_opts = opts[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
-        for i, _ in enumerate(page_opts):
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
+        for i, _ in enumerate(page_items):
             idx = self.page * MOVES_PER_PAGE + i
-            self.add_item(ShogiPickButton(move_letter(idx), idx, row=i // 5))
+            self.add_item(ShogiPickButton(move_letter(i), idx, row=i // 5))
+        if self.page_count > 1:
+            self.add_item(ShogiPageButton("◀", -1, disabled=self.page == 0))
+            self.add_item(
+                ShogiPageButton("▶", 1, disabled=self.page >= self.page_count - 1)
+            )
         if self.phase == "dest":
             self.add_item(ShogiCancelButton())
         self.add_item(ShogiResignButton())
@@ -195,26 +237,42 @@ class ShogiGameView(discord.ui.View):
         game = self._game()
         if not game:
             return {}
-        if self.phase == "piece":
-            marks = {}
-            for i, sel in enumerate(self._options()):
-                if isinstance(sel, tuple) and sel and sel[0] != "hand" and i < 26:
-                    marks[sel] = chr(ord("a") + i)
-            return marks
         marks = {}
-        for i, m in enumerate(self._options()):
-            if i < 26:
-                marks[m["to"]] = chr(ord("a") + i)
+        items = self._page_items()
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
+        if self.phase == "piece":
+            for i, sel in enumerate(page_items):
+                if isinstance(sel, tuple) and sel and sel[0] != "hand":
+                    marks[sel] = chr(ord("a") + i)
+        else:
+            for i, g in enumerate(page_items):
+                marks[g[0]["to"]] = chr(ord("a") + i)
+        return marks
+
+    def stand_markers(self) -> dict:
+        """駒台マーカー {(side, kind): 'a'-'z'}。駒選択ページの持駒分のみ。"""
+        game = self._game()
+        if not game or self.phase != "piece":
+            return {}
+        marks = {}
+        items = self._page_items()
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
+        for i, sel in enumerate(page_items):
+            if isinstance(sel, tuple) and sel and sel[0] == "hand":
+                marks[(game["state"]["turn"], sel[1])] = chr(ord("a") + i)
         return marks
 
     def option_labels(self) -> list[str]:
         game = self._game()
         if not game:
             return []
+        items = self._page_items()
+        page_items = items[self.page * MOVES_PER_PAGE:(self.page + 1) * MOVES_PER_PAGE]
         if self.phase == "piece":
-            return [sel_name(game["state"], s) for s in self._options()]
+            return [sel_name(game["state"], s) for s in page_items]
         labels = []
-        for m in self._options():
+        for g in page_items:
+            m = g[0]
             to = sq_name(*m["to"])
             if m["from"] is None:
                 labels.append(f"{to}に打つ")
@@ -222,12 +280,29 @@ class ShogiGameView(discord.ui.View):
                 labels.append(f"{to}へ" + ("(成/不成選択)" if _needs_promo_choice(game['state'], m) else ""))
         return labels
 
+    async def flip_page(self, interaction: discord.Interaction, delta: int):
+        game = self._game()
+        if not game or not await self.cog.check_turn(interaction, game):
+            return
+        await interaction.response.defer()
+        message = interaction.message
+        assert message is not None
+        if self.cog._expired(game):
+            await self.cog.settle(message, game, self.game_id, winner_color=None)
+            return
+        view = ShogiGameView(
+            self.cog, self.game_id, phase=self.phase, sel=self.sel,
+            page=self.page + delta, notice=self.notice,
+        )
+        view.message = message
+        await self.cog.show_board(message, game, self.game_id, view, notice=view.notice)
+
     async def pick(self, interaction: discord.Interaction, idx: int):
         game = self._game()
         if not game or not await self.cog.check_turn(interaction, game):
             return
-        opts = self._options()
-        if idx >= len(opts):
+        items = self._page_items()
+        if idx >= len(items):
             await interaction.response.send_message("その手は選べません", ephemeral=True)
             return
         await interaction.response.defer()
@@ -237,18 +312,23 @@ class ShogiGameView(discord.ui.View):
             await self.cog.settle(message, game, self.game_id, winner_color=None)
             return
         if self.phase == "piece":
-            sel = opts[idx]
+            sel = items[idx]
             dests = eng.dests_for(game["state"], sel)
             if not dests:
                 await interaction.followup.send("その駒は動けません", ephemeral=True)
                 return
+            if sel[0] == "hand":
+                notice = (f"持{_KANJI.get(sel[1], '?')}を打つ場所を選んでね。"
+                          "駒台の文字ボタン→盤面の文字ボタンの順に押してね(キャンセル可)")
+            else:
+                notice = f"{sel_name(game['state'], sel)}を選択中。移動先を選んでね(キャンセル可)"
             view = ShogiGameView(self.cog, self.game_id, phase="dest", sel=sel,
-                                 notice=f"{sel_name(game['state'], sel)}を選択中。移動先を選んでね(キャンセル可)")
+                                 notice=notice)
             view.message = message
             await self.cog.show_board(message, game, self.game_id, view, notice=view.notice)
         else:
-            # dests_for の要素は move dict。同じ to で成/不成が分かれる場合あり
-            same = [m for m in opts if m["to"] == opts[idx]["to"]]
+            # 移動先は to 毎のグループ。同じ to で成/不成・打/移動が分かれる場合あり
+            same = items[idx]
             if len(same) > 1:
                 view = ShogiPromoView(self.cog, self.game_id, same)
                 view.message = message
@@ -260,8 +340,8 @@ class ShogiGameView(discord.ui.View):
                     view=view,
                 )
                 return
-            game["state"] = eng.apply_move(game["state"], opts[idx])
-            m = opts[idx]
+            game["state"] = eng.apply_move(game["state"], same[0])
+            m = same[0]
             if m["from"] is None:
                 note = f"{_KANJI.get(m['kind'], '?')}を{sq_name(*m['to'])}に打った"
             else:
@@ -534,8 +614,11 @@ class ShogiCog(commands.Cog):
         return True
 
     @staticmethod
-    def board_file(game: dict, markers: dict | None = None) -> discord.File:
-        buf = render_shogi_image(game["state"]["board"], game["state"]["hands"], markers or {}, game["state"]["turn"])
+    def board_file(game: dict, markers: dict | None = None,
+                   stand_marks: dict | None = None) -> discord.File:
+        buf = render_shogi_image(game["state"]["board"], game["state"]["hands"],
+                                 markers or {}, game["state"]["turn"],
+                                 stand_marks or {})
         return discord.File(buf, filename=BOARD_IMAGE_NAME)
 
     def build_game_embed(self, game: dict, markers: dict, notice: str = "") -> discord.Embed:
@@ -558,25 +641,27 @@ class ShogiCog(commands.Cog):
         embed = discord.Embed(title=title, description=desc, color=discord.Color.random())
         embed.add_field(name="掛け金 (1人あたり)", value=buildAmountText(game["bet"]))
         embed.add_field(name="勝ち時ペイアウト", value=payout_text)
-        embed.set_footer(text="駒ボタンを押して選択→移動先ボタンで移動。移動先選択中はキャンセル可。1手・対局とも24hで打切。")
+        embed.set_footer(text="駒ボタンを押して選択→移動先ボタンで移動。持駒は「持○」ボタン→打つ場所。移動先選択中はキャンセル可。1手・対局とも24hで打切。")
         embed.set_image(url=f"attachment://{BOARD_IMAGE_NAME}")
         return embed
 
     def _options_text(self, view: ShogiGameView) -> str:
         labels = view.option_labels()
         lines = []
-        for i, lab in enumerate(labels[view.page * MOVES_PER_PAGE:(view.page + 1) * MOVES_PER_PAGE]):
-            idx = view.page * MOVES_PER_PAGE + i
-            lines.append(f"{move_letter(idx)}: {lab}")
+        for i, lab in enumerate(labels):
+            lines.append(f"{move_letter(i)}: {lab}")
+        if view.page_count > 1:
+            lines.append(f"(p.{view.page + 1}/{view.page_count} ◀▶で切替)")
         return "\n".join(lines) if lines else "選択肢がありません"
 
     async def show_board(self, message: discord.Message, game: dict, gid: int, view: ShogiGameView, notice: str = ""):
         self._set_view(game, view)
         markers = view.markers()
+        smarks = view.stand_markers()
         embed = self.build_game_embed(game, markers, notice)
-        kind = "駒を選んでね" if view.phase == "piece" else "移動先を選んでね(キャンセル可)"
+        kind = "駒を選んでね(持駒は駒台の文字も対応)" if view.phase == "piece" else "移動先を選んでね(キャンセル可)"
         embed.add_field(name=f"選択肢 ({kind})", value=self._options_text(view)[:1000], inline=False)
-        await message.edit(embed=embed, attachments=[self.board_file(game, markers)], view=view)
+        await message.edit(embed=embed, attachments=[self.board_file(game, markers, smarks)], view=view)
 
     async def start_cpu(self, message: discord.Message, player_id: int, bet: int, difficulty: str, player_first: bool):
         gid = self._new_game_id()

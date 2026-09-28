@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -20,15 +21,32 @@ MARK_C = (30, 120, 255)
 HL = (150, 200, 255)
 
 _GLYPH = {
-    "K": "♚", "Q": "♛", "R": "♜", "B": "♝", "N": "♞", "P": "♟",
+    "K": "\u265a", "Q": "\u265b", "R": "\u265c",
+    "B": "\u265d", "N": "\u265e", "P": "\u265f",
 }
+# フォント欠落時の保険 (ASCII駒文字)。
+_ASCII = {"K": "K", "Q": "Q", "R": "R", "B": "B", "N": "N", "P": "P"}
+
+_REPOS = Path(__file__).resolve().parents[1]
+_PIECE_FONT_PATH = _REPOS / "assets" / "fonts" / "DejaVuSans.ttf"
+_LABEL_FONT_PATH = _REPOS / "assets" / "fonts" / "ipaexg.ttf"
 
 
-def _font(size: int):
+def _font(size: int, piece: bool = False):
+    path = _PIECE_FONT_PATH if piece else _LABEL_FONT_PATH
     try:
+        if path.exists():
+            return ImageFont.truetype(str(path), size)
         return ImageFont.load_default(size=size)
     except TypeError:
         return ImageFont.load_default()
+
+
+def _piece_glyph(kind: str) -> str:
+    """駒グリフ。駒フォントが無ければASCIIにフォールバック。"""
+    if _PIECE_FONT_PATH.exists():
+        return _GLYPH[kind.upper()]
+    return _ASCII[kind.upper()]
 
 
 def _norm(markers) -> dict[tuple[int, int], str]:
@@ -36,7 +54,7 @@ def _norm(markers) -> dict[tuple[int, int], str]:
         return {}
     if isinstance(markers, (list, tuple)):
         return {
-            (int(r), int(c)): chr(ord("a") + i) if i < 26 else "?"
+            (int(r), int(c)): chr(ord("a") + i) if i < 26 else str(i + 1)
             for i, (r, c) in enumerate(markers)
         }
     out: dict[tuple[int, int], str] = {}
@@ -44,10 +62,10 @@ def _norm(markers) -> dict[tuple[int, int], str]:
         key = (int(pos[0]), int(pos[1]))
         if isinstance(v, int) and 0 <= v < 26:
             out[key] = chr(ord("a") + v)
-        elif isinstance(v, str) and len(v) == 1 and "a" <= v.lower() <= "z":
-            out[key] = v.lower()
+        elif isinstance(v, str) and v:
+            out[key] = v.lower() if len(v) == 1 else v
         else:
-            out[key] = chr(ord("a") + i) if i < 26 else "?"
+            out[key] = chr(ord("a") + i) if i < 26 else str(i + 1)
     return out
 
 
@@ -56,7 +74,7 @@ def render_chess_image(board, markers=None) -> io.BytesIO:
     size = MARGIN + TILE * 8 + MARGIN
     img = Image.new("RGB", (size, size), BG)
     d = ImageDraw.Draw(img)
-    piece_font = _font(56)
+    piece_font = _font(56, piece=True)
     label_font = _font(24)
     alpha_font = _font(28)
 
@@ -78,7 +96,7 @@ def render_chess_image(board, markers=None) -> io.BytesIO:
             d.rectangle([x0, y0, x0 + TILE, y0 + TILE], fill=base)
             p = board[r][c]
             if p is not None:
-                g = _GLYPH[p.upper()]
+                g = _piece_glyph(p)
                 col = (250, 250, 250) if p.isupper() else (15, 15, 15)
                 bb = d.textbbox((0, 0), g, font=piece_font)
                 tw, th = bb[2] - bb[0], bb[3] - bb[1]

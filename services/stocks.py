@@ -4,17 +4,18 @@
 (mu/sigma/impact) の中で5分ごとにパラメータが再抽選される。
 mu/sigma/impact の個別指定はできない (create/add/paramsでの指定は廃止)。
 
-倒産はHP制 + 追証制: 50tick前の価格を下回るとHPが減り
-(下落率×1.5、1tick最大10)、上回ると回復する。
-HPが尽きた (0になった) ときだけ設立者に通知し、0のまま48時間が経過したら
-破産する (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
-元オーナーは再設立可。警告ライン超まで回復すれば危機から脱出するが、
-危機入り・脱出の全体通知は行わない。
+倒産はHP制 + 追証制: 基準価格 (50tick前と市場平均回帰基準の平均) からの
+下落率が猶予 (市場 drop_threshold_pct + ランクボーナス) を超えるとHPが減り
+(超過分×dmg_per_pct×ランク倍率、1tick最大10)、上回ると回復する。
+HPが尽きた (0になった) とき1エピソード1回だけ通知し、0のまま48時間が
+経過したら破産する (運営・ユーザー問わず): 保有株は紙くず・会社データは
+消去・元オーナーは再設立可。警告ライン超まで回復すれば危機から脱出するが、
+危機入り・脱出の全体通知は行わない。追証は誰でも・いつでも可。
 
 ユーザーは会社を設立できる (レベル連動枠、設立手数料+投資金、
 開始株価=投資金、創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
 自社株は買増不可・売却のみ可。投資額ランクは手数料・創業者株・
-配当率にのみ効き、値動きには影響しない。
+配当率・HPの打たれ強さに効き、値動きには影響しない。
 """
 
 from __future__ import annotations
@@ -68,6 +69,11 @@ ZERO_GRACE_HOURS = 48.0
 HP_BASELINE_TICKS = 50
 # 1tickあたりのHP増減の上限 (安値銘柄の粒度による一撃死を防ぐ)。
 HP_MAX_DELTA_PER_TICK = 10
+# HP下落の猶予 (この下落率までは無傷。超過分だけ削れる)。市場で上書き可。
+HP_DROP_THRESHOLD_PCT = 5.0
+# ランク別の打たれ強さ: ダメージ倍率と猶予ボーナス。
+RANK_DMG_MULT = {"S": 0.5, "A": 0.7, "B": 1.0, "C": 1.2}
+RANK_THRESHOLD_BONUS = {"S": 3.0, "A": 2.0, "B": 0.0, "C": 0.0}
 
 # パラメータ再抽選の間隔 (tick回数。tick=1分のため5tick=5分ごと)。
 RANDOMIZE_EVERY_TICKS = 5
@@ -96,6 +102,7 @@ class Stock:
     rank: str | None = None  # 設立時の投資額ランク (S/A/B/C)。運営銘柄はNone
     start_price: int = 100  # 開始価格 (表示用。破産判定には使わない)
     floor_since: str | None = None  # 旧制度の残骸 (未使用。読み取りのみ互換保持)
+    zero_notified_at: str | None = None  # HP枯渇通知の送信時刻。回復でクリア
 
 
 def normalize_ticker(raw: str) -> str:
@@ -201,6 +208,7 @@ def _row_to_stock(row) -> Stock:
         rank=_opt("rank"),
         start_price=int(start_price) if start_price is not None else 100,
         floor_since=_opt("floor_since"),
+        zero_notified_at=_opt("zero_notified_at"),
     )
 
 
@@ -229,6 +237,7 @@ class Market:
     rescue_hp_per_100: float = RESCUE_HP_PER_100
     rescue_hours: float = RESCUE_HOURS
     zero_grace_hours: float = ZERO_GRACE_HOURS
+    drop_threshold_pct: float = HP_DROP_THRESHOLD_PCT
     mean_ref_price: float | None = None
     mean_k: float | None = None
 
@@ -319,6 +328,7 @@ def _row_to_market(row) -> Market:
         rescue_hp_per_100=_num("rescue_hp_per_100", RESCUE_HP_PER_100),
         rescue_hours=_num("rescue_hours", RESCUE_HOURS),
         zero_grace_hours=_num("zero_grace_hours", ZERO_GRACE_HOURS),
+        drop_threshold_pct=_num("drop_threshold_pct", HP_DROP_THRESHOLD_PCT),
         mean_ref_price=float(mean_ref) if mean_ref is not None else None,
         mean_k=float(mean_k) if mean_k is not None else None,
     )
@@ -350,9 +360,17 @@ async def ensure_market_schema() -> None:
         "rescue_hp_per_100 REAL NOT NULL DEFAULT 10.0, "
         "rescue_hours REAL NOT NULL DEFAULT 48.0, "
         "zero_grace_hours REAL NOT NULL DEFAULT 48.0, "
+        "drop_threshold_pct REAL NOT NULL DEFAULT 5.0, "
         "mean_ref_price REAL NULL, mean_k REAL NULL, "
         "updated_at TEXT NOT NULL)"
     )
+    cursor = await DBService.pool.execute("PRAGMA table_info(markets)")
+    mcols = {r["name"] for r in await cursor.fetchall()}
+    await cursor.close()
+    if "drop_threshold_pct" not in mcols:
+        await DBService.pool.execute(
+            "ALTER TABLE markets ADD COLUMN drop_threshold_pct REAL NOT NULL DEFAULT 5.0"
+        )
     cursor = await DBService.pool.execute("PRAGMA table_info(stocks)")
     cols = {r["name"] for r in await cursor.fetchall()}
     await cursor.close()
@@ -364,6 +382,8 @@ async def ensure_market_schema() -> None:
         await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN crisis_since TEXT NULL")
     if "rank" not in cols:
         await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN rank TEXT NULL")
+    if "zero_notified_at" not in cols:
+        await DBService.pool.execute("ALTER TABLE stocks ADD COLUMN zero_notified_at TEXT NULL")
     now = _now()
     for m in SEED_MARKETS:
         await DBService.pool.execute(
@@ -435,6 +455,8 @@ def _check_market_ranges(m: Market) -> None:
             raise ValueError(f"{key} は0以上にしてください")
     if m.rescue_hours <= 0 or m.zero_grace_hours < 0:
         raise ValueError("rescue_hours は正、zero_grace_hours は0以上にしてください")
+    if m.drop_threshold_pct < 0:
+        raise ValueError("drop_threshold_pct は0以上にしてください")
     if m.mean_ref_price is not None and m.mean_ref_price <= 0:
         raise ValueError("mean_ref_price は正にしてください")
     if m.mean_k is not None and m.mean_k < 0:
@@ -478,6 +500,7 @@ async def update_market(market_id: str, **fields) -> Market:
         "sigma_min", "sigma_max", "impact_min", "impact_max", "jitter",
         "hp_max", "warning_hp", "dmg_per_pct", "recover_per_pct",
         "rescue_hp_per_100", "rescue_hours", "zero_grace_hours",
+        "drop_threshold_pct",
         "mean_ref_price", "mean_k",
     }
     for key in fields:
@@ -583,19 +606,40 @@ async def randomize_params(
     return updated
 
 
-def hp_after(market: Market, hp: int, baseline: int | None, new_price: int) -> int:
+def hp_after(
+    market: Market,
+    hp: int,
+    baseline: int | None,
+    new_price: int,
+    rank: str | None = None,
+) -> int:
     """1tick分のHP増減。基準は baseline (HP_BASELINE_TICKS tick前の価格)。
 
-    下回れば減・上回れば回復。1tickの増減は上限で丸め、0〜hp_maxに収める。
-    baseline が None (履歴なし) なら増減しない。
+    下落率が猶予 (市場 drop_threshold_pct + ランクボーナス) 以内なら無傷で、
+    超過分だけ `dmg_per_pct × ランク倍率` で削れる。高ランクほど打たれ強い。
+    上昇分は従来どおり回復する。1tickの増減は上限で丸め、0〜hp_maxに収める。
+    市場に mean_ref_price がある場合は基準を「履歴と平均回帰基準の平均」に
+    して市場価値も反映する。baseline が None (履歴なし) なら増減しない。
     """
     if baseline is None or baseline < 1:
         return max(0, min(hp, market.hp_max))
-    if new_price == baseline:
+    ref = market.mean_ref_price
+    if ref is not None and ref > 0:
+        base = (baseline + ref) / 2.0
+    else:
+        base = float(baseline)
+    if new_price == base:
         return max(0, min(hp, market.hp_max))
-    pct = (new_price - baseline) / baseline * 100.0
-    rate = market.dmg_per_pct if pct < 0 else market.recover_per_pct
-    delta = max(-HP_MAX_DELTA_PER_TICK, min(HP_MAX_DELTA_PER_TICK, pct * rate))
+    pct = (new_price - base) / base * 100.0
+    if pct >= 0:
+        delta = min(HP_MAX_DELTA_PER_TICK, pct * market.recover_per_pct)
+    else:
+        threshold = market.drop_threshold_pct + RANK_THRESHOLD_BONUS.get(rank, 0.0)
+        excess = -pct - threshold
+        if excess <= 0:
+            return max(0, min(hp, market.hp_max))
+        mult = RANK_DMG_MULT.get(rank, 1.0)
+        delta = -min(HP_MAX_DELTA_PER_TICK, excess * market.dmg_per_pct * mult)
     return max(0, min(market.hp_max, int(hp + delta)))
 
 
@@ -786,6 +830,8 @@ async def tick_once(
     crisis_since を現在時刻に付け替え (0起点の計測開始)、
     0のまま猶予時間 (zero_grace_hours) が経過したら破産させる
     (運営・ユーザー問わず)。警告ライン超に回復すれば脱出する。
+    HP枯渇の通知は1エピソード1回 (zero_notified_atで管理し、
+    HPが0超に回復するまで再通知しない)。
     値上がりしたユーザー企業には創業者配当を付与する。
     戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id, market_id}],
     HP到達通知 [{ticker, owner_id, market_id, price, deadline_hours}])。
@@ -816,21 +862,24 @@ async def tick_once(
             logger.exception("株価tickの計算に失敗 ticker=%s", stock.ticker)
             continue
         baseline = await get_baseline_price(stock.ticker)
-        new_hp = hp_after(market, stock.hp, baseline, new_price)
+        new_hp = hp_after(market, stock.hp, baseline, new_price, stock.rank)
         crisis_new = stock.crisis_since
+        notified_new = stock.zero_notified_at
         if new_hp <= 0 and stock.hp > 0:
-            # HPが尽きた: 0起点の計測を開始して1回だけ通知する。
-            # 0継続中のtickでは通知しない (減るたびのメンション防止)。
+            # HPが尽きた: 0起点の計測を開始する。
             crisis_new = now_iso
-            zeroed.append(
-                {
-                    "ticker": stock.ticker,
-                    "owner_id": stock.owner_id,
-                    "market_id": market.id,
-                    "price": new_price,
-                    "deadline_hours": market.zero_grace_hours,
-                }
-            )
+            if not stock.zero_notified_at:
+                # 未通知の枯渇だけ1回通知する。HPが回復するまで再通知しない。
+                notified_new = now_iso
+                zeroed.append(
+                    {
+                        "ticker": stock.ticker,
+                        "owner_id": stock.owner_id,
+                        "market_id": market.id,
+                        "price": new_price,
+                        "deadline_hours": market.zero_grace_hours,
+                    }
+                )
         elif new_hp <= market.warning_hp and not stock.crisis_since:
             # 経営危機に突入: 時刻だけ記録する (通知はしない)
             crisis_new = now_iso
@@ -856,10 +905,13 @@ async def tick_once(
                     info["market_id"] = market.id
                     bankrupted.append(info)
                     continue
+        if new_hp > 0:
+            # HPが残っている=枯渇 episode 終了。次回の枯渇で再通知する。
+            notified_new = None
         await DBService.pool.execute(
             "UPDATE stocks SET price = ?, hp = ?, crisis_since = ?, "
-            "updated_at = ? WHERE ticker = ?",
-            (new_price, new_hp, crisis_new, now_iso, stock.ticker),
+            "zero_notified_at = ?, updated_at = ? WHERE ticker = ?",
+            (new_price, new_hp, crisis_new, notified_new, now_iso, stock.ticker),
         )
         await DBService.pool.execute(
             "INSERT INTO stock_history (ticker, price, created_at) VALUES (?, ?, ?)",
@@ -875,6 +927,7 @@ async def tick_once(
         stock.price = new_price
         stock.hp = new_hp
         stock.crisis_since = crisis_new
+        stock.zero_notified_at = notified_new
         updated.append(stock)
         if gain > 0 and stock.owner_id is not None:
             # 創業者配当。失敗してもtick全体は止めない。
@@ -1309,10 +1362,11 @@ async def add_investment(
 
 
 async def rescue(user_id: int, ticker: str, amount: int) -> tuple[int, int, bool]:
-    """追証: 設立者が資金を投じて危機の銘柄のHPを回復する。
+    """追証: 誰でも資金を投じて銘柄のHPを回復できる (札束で叩く)。
 
+    運営銘柄・他人の会社も可。危機でなくても平常時追証として回復できる。
     戻り値は (回復HP, 回復後HP, 危機脱出したか)。
-    危機でない銘柄・他人の会社・金額不正は ValueError。
+    HP満タン・金額不正は ValueError。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     """
     await ensure_market_schema()
@@ -1322,12 +1376,9 @@ async def rescue(user_id: int, ticker: str, amount: int) -> tuple[int, int, bool
     stock = await get_stock(ticker)
     if not stock:
         raise ValueError(f"{ticker} は存在しません")
-    if stock.owner_id != user_id:
-        raise ValueError(f"{ticker} はあなたの会社ではありません")
     market = await require_market(stock.market_id)
-    in_crisis, _ = crisis_info(stock, market)
-    if not in_crisis:
-        raise ValueError(f"{ticker} は経営危機ではありません (HP {stock.hp})")
+    if stock.hp >= market.hp_max:
+        raise ValueError(f"{ticker} のHPは満タンです (HP {stock.hp})")
     cursor = await DBService.pool.execute(
         "SELECT amount FROM users WHERE id = ?", (user_id,)
     )
@@ -1344,14 +1395,15 @@ async def rescue(user_id: int, ticker: str, amount: int) -> tuple[int, int, bool
             f"追証額が少なすぎます (この市場は100通貨あたり"
             f"{market.rescue_hp_per_100:g}HP回復)"
         )
+    was_crisis, _ = crisis_info(stock, market)
     new_hp = min(stock.hp + gain, market.hp_max)
-    escaped = new_hp > market.warning_hp
+    escaped = was_crisis and new_hp > market.warning_hp
     await DBService.pool.execute(
         "UPDATE users SET amount = amount - ? WHERE id = ?", (amount, user_id)
     )
     await DBService.pool.execute(
-        "UPDATE stocks SET hp = ?, crisis_since = ?, updated_at = ? "
-        "WHERE ticker = ?",
+        "UPDATE stocks SET hp = ?, crisis_since = ?, zero_notified_at = NULL, "
+        "updated_at = ? WHERE ticker = ?",
         (new_hp, None if escaped else stock.crisis_since, _now(), ticker),
     )
     await DBService.pool.commit()

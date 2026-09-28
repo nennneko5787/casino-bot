@@ -7,9 +7,11 @@
 銘柄は株式市場に所属し、市場ごとに値動きレンジ (mu/sigma/impact) と
 HP倒産ルールが違う。mu/sigma/impactは5分ごとに市場レンジ内で自動再抽選
 され、個別指定はできない (params廃止)。
-倒産はHP制 + 追証制: 下落でHPが減り、HPが尽きたときだけ設立者に通知する。
-0のまま48時間以内に追証 (rescue) で回復しなければ破産
+倒産はHP制 + 追証制: 猶予を超える下落でHPが減り (猶予・倍率は市場と
+ランクで変動)、HPが尽きたとき1エピソード1回だけ通知する。
+0のまま48時間以内に追証 (rescue・誰でも可) で回復しなければ破産
 (保有株は紙くず・会社消去)。危機入り・脱出の全体通知は行わない。
+平常時も札束でHP回復 (追証) できる。
 """
 
 import asyncio
@@ -271,7 +273,8 @@ class StockCog(commands.Cog):
                 f"🪫 `{info['ticker']}` のHPが尽きました"
                 f"（市場{info['market_id']}）\n"
                 f"設立者: {owner}／{info['deadline_hours']:g}時間以内に"
-                "`/stock rescue` で追証しなければ削除されます"
+                "誰でも `/stock rescue` で追証できます"
+                "（回復するまで再通知しません）"
             )
         for info in bankrupted:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
@@ -532,6 +535,11 @@ class StockCog(commands.Cog):
                 f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact:.4f}/株"
                 + ("" if stock.is_active else "\n※取扱停止中")
                 + market_note
+                + (
+                    f"\n下落猶予{market.drop_threshold_pct:g}%"
+                    + (f"(ランク{stock.rank}の打たれ強さ適用)" if stock.rank else "")
+                    if market else ""
+                )
             ),
             color=discord.Color.blue(),
         )
@@ -705,10 +713,10 @@ class StockCog(commands.Cog):
             "※株価は変わりません (時価増資のため)"
         )
 
-    @stock.command(name="rescue", brief="経営危機の自社に追証します (HP回復)")
+    @stock.command(name="rescue", brief="会社に追証します (HP回復・誰でも可)")
     @app_commands.rename(ticker="銘柄", amount="追証額")
     @app_commands.describe(
-        ticker="自分の会社の銘柄",
+        ticker="追証する会社の銘柄 (運営・他人・自分の会社すべて可)",
         amount="投じる金額 (1以上)。HPが回復します",
     )
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -731,11 +739,15 @@ class StockCog(commands.Cog):
             stock = await stocks.get_stock(ticker.strip().upper())
             if stock is not None:
                 market = await stocks.get_market(stock.market_id)
-                rest = (
-                    stocks.rescue_deadline_hours(stock, market)
-                    if market else 0.0
+                in_crisis = (
+                    stocks.crisis_info(stock, market)[0]
+                    if market else False
                 )
-                note = f"引き続き経営危機です (期限まで残り約{rest:.1f}h)"
+                if in_crisis and market is not None:
+                    rest = stocks.rescue_deadline_hours(stock, market)
+                    note = f"引き続き経営危機です (期限まで残り約{rest:.1f}h)"
+                else:
+                    note = "💪 HPが回復しました！"
             else:
                 note = ""
         await ctx.reply(
@@ -904,6 +916,7 @@ class StockCog(commands.Cog):
             f"σ[{m.sigma_min:g}〜{m.sigma_max:g}] "
             f"impact[{m.impact_min:g}〜{m.impact_max:g}]\n"
             f"HP上限{m.hp_max}・警告{m.warning_hp}・"
+            f"下落猶予{m.drop_threshold_pct:g}%・"
             f"追証期限{m.rescue_hours:g}h・HP0猶予{m.zero_grace_hours:g}h"
             + (
                 f"・平均回帰(基準{m.mean_ref_price:g}, k={m.mean_k:g})"
@@ -986,6 +999,7 @@ class StockCog(commands.Cog):
         hp_max="HP上限", warning_hp="危機ラインHP",
         dmg_per_pct="下落1%あたりのHP減",
         recover_per_pct="上昇1%あたりのHP回復",
+        drop_threshold_pct="この下落率%まではHP無傷",
         rescue_hp_per_100="100通貨あたりの回復HP",
         rescue_hours="追証期限h",
         zero_grace_hours="HP0の猶予h",
@@ -1008,6 +1022,7 @@ class StockCog(commands.Cog):
         warning_hp: int | None = None,
         dmg_per_pct: float | None = None,
         recover_per_pct: float | None = None,
+        drop_threshold_pct: float | None = None,
         rescue_hp_per_100: float | None = None,
         rescue_hours: float | None = None,
         zero_grace_hours: float | None = None,
@@ -1019,6 +1034,7 @@ class StockCog(commands.Cog):
                 "impact_min": impact_min, "impact_max": impact_max,
                 "jitter": jitter, "hp_max": hp_max, "warning_hp": warning_hp,
                 "dmg_per_pct": dmg_per_pct, "recover_per_pct": recover_per_pct,
+                "drop_threshold_pct": drop_threshold_pct,
                 "rescue_hp_per_100": rescue_hp_per_100,
                 "rescue_hours": rescue_hours,
                 "zero_grace_hours": zero_grace_hours,
