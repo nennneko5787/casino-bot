@@ -7,7 +7,6 @@ VC1分ごとに変動XP (8〜12)。レベル式は 5*Lv^2+50*Lv+100 の二次カ
 """
 
 import asyncio
-import dotenv
 import io
 import logging
 import os
@@ -15,6 +14,7 @@ from contextlib import suppress
 from datetime import datetime
 
 import discord
+import dotenv
 from discord import app_commands
 from discord.ext import commands, tasks
 
