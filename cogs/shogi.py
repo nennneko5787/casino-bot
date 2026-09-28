@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from contextlib import suppress
 from sqlite3 import Error as SQLiteError
 
@@ -33,6 +34,8 @@ PVP_RAKE = 0.95
 MOVES_PER_PAGE = 20
 BOARD_IMAGE_NAME = "shogi.png"
 RANK_KANJI = "一二三四五六七八九"
+MOVE_TIMEOUT = 86400.0  # 1手あたりの放置制限 (24h。操作のたびにリセットされる)
+GAME_LIMIT_SECONDS = 86400.0  # 対局全体の打ち切り (開始から24hで引き分け返金)
 
 _KANJI = {
     "P": "歩", "L": "香", "N": "桂", "S": "銀", "G": "金",
@@ -111,7 +114,7 @@ class ShogiPromoView(discord.ui.View):
     """成る/不成の選択。キャンセルで駒選択に戻る。"""
 
     def __init__(self, cog: ShogiCog, game_id: int, moves: list):
-        super().__init__(timeout=300)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.game_id = game_id
         self.message: discord.Message | None = None
@@ -124,6 +127,11 @@ class ShogiPromoView(discord.ui.View):
         if not game or not await self.cog.check_turn(interaction, game):
             return
         await interaction.response.defer()
+        message = interaction.message
+        assert message is not None
+        if self.cog._expired(game):
+            await self.cog.settle(message, game, self.game_id, winner_color=None)
+            return
         if promote is None:
             view = ShogiGameView(self.cog, self.game_id, phase="piece")
             view.message = interaction.message
@@ -147,7 +155,7 @@ class ShogiGameView(discord.ui.View):
 
     def __init__(self, cog: ShogiCog, game_id: int, phase: str = "piece",
                  sel=None, page: int = 0, notice: str = ""):
-        super().__init__(timeout=300)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.game_id = game_id
         self.phase = phase
@@ -225,6 +233,9 @@ class ShogiGameView(discord.ui.View):
         await interaction.response.defer()
         message = interaction.message
         assert message is not None
+        if self.cog._expired(game):
+            await self.cog.settle(message, game, self.game_id, winner_color=None)
+            return
         if self.phase == "piece":
             sel = opts[idx]
             dests = eng.dests_for(game["state"], sel)
@@ -241,6 +252,7 @@ class ShogiGameView(discord.ui.View):
             if len(same) > 1:
                 view = ShogiPromoView(self.cog, self.game_id, same)
                 view.message = message
+                self.cog._set_view(game, view)
                 marks = {same[0]["to"]: "a"}
                 await message.edit(
                     embed=self.cog.build_game_embed(game, marks, f"{sq_name(*same[0]['to'])}で成る?"),
@@ -281,6 +293,9 @@ class ShogiGameView(discord.ui.View):
         await self.cog.settle(message, game, self.game_id, resigned_id=interaction.user.id)
 
     async def on_timeout(self):
+        game = self.cog.games.get(self.game_id)
+        if game is not None and game.get("view") is not self:
+            return  # 旧Viewの遅延発火。現行の対局には触らない
         game = self.cog.games.pop(self.game_id, None)
         if game:
             for uid in {game["sente_id"], game["gote_id"]}:
@@ -305,7 +320,7 @@ def _needs_promo_choice(state: dict, move: dict) -> bool:
 
 class ShogiChallengeView(discord.ui.View):
     def __init__(self, cog: ShogiCog, host_id: int, guest_id: int, bet: int, host_first: str):
-        super().__init__(timeout=60)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.host_id = host_id
         self.guest_id = guest_id
@@ -368,7 +383,7 @@ class ShogiChallengeView(discord.ui.View):
 
 class ShogiOpenLobbyView(discord.ui.View):
     def __init__(self, cog: ShogiCog, host_id: int, bet: int, host_first: str):
-        super().__init__(timeout=120)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.host_id = host_id
         self.bet = bet
@@ -440,7 +455,7 @@ class ShogiOpenLobbyView(discord.ui.View):
 
 class ShogiRematchView(discord.ui.View):
     def __init__(self, cog: ShogiCog, author_id: int, bet: int, difficulty: str, player_first: bool):
-        super().__init__(timeout=180)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.author_id = author_id
         self.bet = bet
@@ -490,6 +505,24 @@ class ShogiCog(commands.Cog):
         self._next_game_id += 1
         return gid
 
+    @staticmethod
+    def _set_view(game: dict, view: discord.ui.View | None) -> None:
+        """現行Viewを差し替え、古いViewの放置タイマーを止める。
+
+        切替前のViewを止めないと、古いタイマーが後から発火して
+        進行中の対局を中止・返金・上書きしてしまう。
+        """
+        old = game.get("view")
+        if old is not None and old is not view:
+            with suppress(Exception):
+                old.stop()
+        game["view"] = view
+
+    @staticmethod
+    def _expired(game: dict) -> bool:
+        """開始から24h超過ならTrue (対局全体の打ち切り)。"""
+        return time.monotonic() - game.get("started_at", time.monotonic()) >= GAME_LIMIT_SECONDS
+
     async def check_turn(self, interaction: discord.Interaction, game: dict) -> bool:
         if interaction.user.id not in (game["sente_id"], game["gote_id"]):
             await interaction.response.send_message("このゲームの参加者ではありません", ephemeral=True)
@@ -525,7 +558,7 @@ class ShogiCog(commands.Cog):
         embed = discord.Embed(title=title, description=desc, color=discord.Color.random())
         embed.add_field(name="掛け金 (1人あたり)", value=buildAmountText(game["bet"]))
         embed.add_field(name="勝ち時ペイアウト", value=payout_text)
-        embed.set_footer(text="駒ボタンを押して選択→移動先ボタンで移動。移動先選択中はキャンセル可")
+        embed.set_footer(text="駒ボタンを押して選択→移動先ボタンで移動。移動先選択中はキャンセル可。1手・対局とも24hで打切。")
         embed.set_image(url=f"attachment://{BOARD_IMAGE_NAME}")
         return embed
 
@@ -538,6 +571,7 @@ class ShogiCog(commands.Cog):
         return "\n".join(lines) if lines else "選択肢がありません"
 
     async def show_board(self, message: discord.Message, game: dict, gid: int, view: ShogiGameView, notice: str = ""):
+        self._set_view(game, view)
         markers = view.markers()
         embed = self.build_game_embed(game, markers, notice)
         kind = "駒を選んでね" if view.phase == "piece" else "移動先を選んでね(キャンセル可)"
@@ -552,6 +586,7 @@ class ShogiCog(commands.Cog):
             "gote_id": 0 if player_first else player_id,
             "bet": bet, "mode": "cpu", "difficulty": difficulty,
             "mult": DIFFICULTY_MULT[difficulty], "player_first": player_first,
+            "started_at": time.monotonic(), "view": None,
         }
         with suppress(Exception):
             await missions.record_event(player_id, "game")
@@ -561,7 +596,8 @@ class ShogiCog(commands.Cog):
     async def start_pvp_direct(self, message: discord.Message, sente_id: int, gote_id: int, bet: int):
         gid = self._new_game_id()
         self.games[gid] = {"state": eng.new_state(), "turn": 0,
-                           "sente_id": sente_id, "gote_id": gote_id, "bet": bet, "mode": "pvp"}
+                           "sente_id": sente_id, "gote_id": gote_id, "bet": bet, "mode": "pvp",
+                           "started_at": time.monotonic(), "view": None}
         with suppress(Exception):
             await missions.record_event(sente_id, "game")
             await missions.record_event(gote_id, "game")
@@ -572,6 +608,9 @@ class ShogiCog(commands.Cog):
                                     guest_id if host_sente else host_id, bet)
 
     async def advance(self, message: discord.Message, game: dict, gid: int, notice: str = ""):
+        if self._expired(game):
+            await self.settle(message, game, gid, winner_color=None)
+            return
         while True:
             over, winner = eng.is_game_over(game["state"])
             if over:
@@ -597,6 +636,7 @@ class ShogiCog(commands.Cog):
             return
 
     async def settle(self, message, game, gid, winner_color: int | None = None, resigned_id: int | None = None):
+        self._set_view(game, None)
         bet = game["bet"]
         self.games.pop(gid, None)
         if resigned_id is not None:
@@ -688,6 +728,7 @@ class ShogiCog(commands.Cog):
             "gote_id": 0 if first else ctx.author.id,
             "bet": bet, "mode": "cpu", "difficulty": diff,
             "mult": DIFFICULTY_MULT[diff], "player_first": first,
+            "started_at": time.monotonic(), "view": None,
         }
         with suppress(Exception):
             await missions.record_event(ctx.author.id, "game")

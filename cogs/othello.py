@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from contextlib import suppress
 from copy import deepcopy
 from sqlite3 import Error as SQLiteError
@@ -49,6 +50,8 @@ ROW_FW = "１２３４５６７８"
 REGIONAL_BASE = 0x1F1E6  # 🇦
 MOVES_PER_PAGE = 20  # ボタン4行分。残り1行はページ送り/降参用
 BOARD_IMAGE_NAME = "othello.png"  # Embed側は attachment://othello.png で参照
+MOVE_TIMEOUT = 86400.0  # 1手あたりの放置制限 (24h。操作のたびにリセットされる)
+GAME_LIMIT_SECONDS = 86400.0  # 対局全体の打ち切り (開始から24hで引き分け返金)
 
 
 def move_letter(i: int) -> str:
@@ -294,7 +297,7 @@ class OthelloGameView(discord.ui.View):
     def __init__(
         self, cog: "OthelloCog", game_id: int, page: int = 0, notice: str = ""
     ):
-        super().__init__(timeout=300)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.game_id = game_id
         self.page = page
@@ -360,6 +363,12 @@ class OthelloGameView(discord.ui.View):
         game = await self._turn_game(interaction)
         if not game:
             return
+        if self.cog._expired(game):
+            await interaction.response.defer()
+            message = interaction.message
+            assert message is not None
+            await self.cog.settle(message, game, self.game_id)
+            return
         if not flips_for(game["board"], game["turn"], r, c):
             await interaction.response.send_message(
                 "そこには置けません", ephemeral=True
@@ -382,12 +391,16 @@ class OthelloGameView(discord.ui.View):
         if not game:
             return
         await interaction.response.defer()
+        message = interaction.message
+        assert message is not None
+        if self.cog._expired(game):
+            await self.cog.settle(message, game, self.game_id)
+            return
         view = OthelloGameView(
             self.cog, self.game_id, page=self.page + delta, notice=self.notice
         )
-        message = interaction.message
-        assert message is not None
         view.message = message
+        self.cog._set_view(game, view)
         hints = self.cog.hint_markers(game, self.cog.tiles)
         await message.edit(
             embed=self.cog.build_game_embed(
@@ -425,6 +438,9 @@ class OthelloGameView(discord.ui.View):
         )
 
     async def on_timeout(self):
+        game = self.cog.games.get(self.game_id)
+        if game is not None and game.get("view") is not self:
+            return  # 旧Viewの遅延発火。現行の対局には触らない
         game = self.cog.games.pop(self.game_id, None)
         if game:
             # タイムアウトは中止扱いで全額返金 (ベストエフォート)
@@ -454,7 +470,7 @@ class ChallengeView(discord.ui.View):
     def __init__(
         self, cog: "OthelloCog", host_id: int, guest_id: int, bet: int, host_first: str
     ):
-        super().__init__(timeout=60)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.host_id = host_id
         self.guest_id = guest_id
@@ -538,7 +554,7 @@ class OpenLobbyView(discord.ui.View):
     """参加者募集: やりたい人がボタンを押して参加。"""
 
     def __init__(self, cog: "OthelloCog", host_id: int, bet: int, host_first: str):
-        super().__init__(timeout=120)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.host_id = host_id
         self.bet = bet
@@ -631,7 +647,7 @@ class OthelloRematchView(discord.ui.View):
         difficulty: str,
         player_first: bool,
     ):
-        super().__init__(timeout=180)
+        super().__init__(timeout=MOVE_TIMEOUT)
         self.cog = cog
         self.author_id = author_id
         self.bet = bet
@@ -745,6 +761,24 @@ class OthelloCog(commands.Cog):
         self._next_game_id += 1
         return gid
 
+    @staticmethod
+    def _set_view(game: dict, view: discord.ui.View | None) -> None:
+        """現行Viewを差し替え、古いViewの放置タイマーを止める。
+
+        切替前のViewを止めないと、古いタイマーが後から発火して
+        進行中の対局を中止・返金・上書きしてしまう。
+        """
+        old = game.get("view")
+        if old is not None and old is not view:
+            with suppress(Exception):
+                old.stop()
+        game["view"] = view
+
+    @staticmethod
+    def _expired(game: dict) -> bool:
+        """開始から24h超過ならTrue (対局全体の打ち切り)。"""
+        return time.monotonic() - game.get("started_at", time.monotonic()) >= GAME_LIMIT_SECONDS
+
     # ----- ゲーム開始 -----
 
     async def start_cpu(
@@ -768,6 +802,8 @@ class OthelloCog(commands.Cog):
             "difficulty": difficulty,
             "mult": DIFFICULTY_MULT[difficulty],
             "player_first": player_first,
+            "started_at": time.monotonic(),
+            "view": None,
         }
         # ミッション: プレー回数を記録 (失敗してもゲームは続行)
         with suppress(Exception):
@@ -794,6 +830,8 @@ class OthelloCog(commands.Cog):
             "white_id": white_id,
             "bet": bet,
             "mode": "pvp",
+            "started_at": time.monotonic(),
+            "view": None,
         }
         # ミッション: 両者のプレー回数を記録 (失敗してもゲームは続行)
         with suppress(Exception):
@@ -856,7 +894,7 @@ class OthelloCog(commands.Cog):
         embed.add_field(name="掛け金 (1人あたり)", value=buildAmountText(game["bet"]))
         embed.add_field(name="⚫ / ⚪", value=f"{black_n} / {white_n}")
         embed.add_field(name="勝ち時ペイアウト", value=payout_text)
-        footer = "盤面の文字🇦〜と同じボタンを押して着手。パスは自動。"
+        footer = "盤面の文字🇦〜と同じボタンを押して着手。パスは自動。1手・対局とも24hで打切。"
         if pages > 1:
             footer += f" ({page + 1}/{pages}ページ)"
         if any(v == "🟨" for v in hints.values()):
@@ -873,6 +911,9 @@ class OthelloCog(commands.Cog):
         notice: str = "",
     ):
         """手番の自動進行 (パス・CPU着手)。最後に盤面を1回編集する。"""
+        if self._expired(game):
+            await self.settle(message, game, gid)
+            return
         while True:
             if is_game_over(game["board"]):
                 await self.settle(message, game, gid)
@@ -902,6 +943,7 @@ class OthelloCog(commands.Cog):
                 continue
             view = OthelloGameView(self, gid, notice=notice)
             view.message = message
+            self._set_view(game, view)
             hints = self.hint_markers(game, self.tiles)
             await message.edit(
                 embed=self.build_game_embed(
@@ -924,6 +966,7 @@ class OthelloCog(commands.Cog):
         winner_id: int | None = None,
         resigned_id: int | None = None,
     ):
+        self._set_view(game, None)
         black_n, white_n = count_discs(game["board"])
         bet = game["bet"]
         if resigned_id is not None:
@@ -1074,6 +1117,8 @@ class OthelloCog(commands.Cog):
             "difficulty": diff,
             "mult": DIFFICULTY_MULT[diff],
             "player_first": first,
+            "started_at": time.monotonic(),
+            "view": None,
         }
         # ミッション: プレー回数を記録 (失敗してもゲームは続行)
         with suppress(Exception):
