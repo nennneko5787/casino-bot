@@ -7,14 +7,15 @@
 mu/sigma/impactは投資額ランクで自動決定、
 創業者株+売買ロイヤリティ+値上がり配当あり)。
 自社株は買増不可・売却のみ可。
-開始価格割れ + 下落継続で危険水域に入り、下落したまま6時間続いた会社は
-破産 (保有株は紙くず・会社消去)。下落が止まって1時間続くか、
+開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
+会社は破産 (保有株は紙くず・会社消去)。下落が止まって1時間続くか、
 開始価格以上に回復すれば脱出。
 """
 
 import asyncio
 import logging
 import os
+import time
 from contextlib import suppress
 
 import discord
@@ -63,12 +64,21 @@ async def ticker_autocomplete(
 class StockCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._last_tick_at: float | None = None
 
     async def cog_load(self):
         self.tick_loop.start()
+        # 起動時再チェック: 停止中のtick分を評価し直す。
+        # tick_loop初回も即時実行されるため、_run_tick内のガードで二重進行を防ぐ。
+        asyncio.get_running_loop().create_task(self._startup_review())
 
     async def cog_unload(self):
         self.tick_loop.cancel()
+
+    async def _startup_review(self):
+        await self.bot.wait_until_ready()
+        logger.info("株価の起動時再チェックを実行します")
+        await self._run_tick()
 
     async def _log_channel(
         self, guild: discord.Guild | None
@@ -92,10 +102,14 @@ class StockCog(commands.Cog):
                 if ch is not None:
                     await ch.send(msg)
 
-    @tasks.loop(minutes=TICK_INTERVAL_MINUTES)
-    async def tick_loop(self):
+    async def _run_tick(self):
+        # 起動時再チェックとtick_loop初回が重なった場合は片方だけ進める
+        now = time.monotonic()
+        if self._last_tick_at is not None and now - self._last_tick_at < 45:
+            return
+        self._last_tick_at = now
         try:
-            _, bankrupted, warned = await stocks.tick_once()
+            _, bankrupted, warned, escaped = await stocks.tick_once()
         except Exception:
             logger.exception("株価の定期更新に失敗")
             return
@@ -103,18 +117,30 @@ class StockCog(commands.Cog):
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
                 f"⚠️ `{info['ticker']}` が倒産危機です"
-                f"（開始{buildAmountText(info['start_price'])}→現在"
-                f"{buildAmountText(info['price'])}）\n"
+                f"（開始{buildAmountText(info['start_price'])}"
+                f"・危険ライン{buildAmountText(info['threshold'])}"
+                f"→現在{buildAmountText(info['price'])}）\n"
                 f"設立者: {owner}／下落が{stocks.BANKRUPT_DANGER_HOURS}時間続けば破産、"
                 "止まれば脱出します"
+            )
+        for info in escaped:
+            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
+            await self._broadcast(
+                f"✅ `{info['ticker']}` が危険水域から脱出しました"
+                f"（現在{buildAmountText(info['price'])}）\n"
+                f"設立者: {owner}"
             )
         for info in bankrupted:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
                 f"💸 `{info['ticker']}` が破産しました"
-                f"（開始価格割れが{stocks.BANKRUPT_DANGER_HOURS}時間継続）\n"
+                f"（開始価格の50%割れが{stocks.BANKRUPT_DANGER_HOURS}時間継続）\n"
                 f"設立者: {owner}／保有株は紙くずになりました"
             )
+
+    @tasks.loop(minutes=TICK_INTERVAL_MINUTES)
+    async def tick_loop(self):
+        await self._run_tick()
 
     @tick_loop.before_loop
     async def _before_tick(self):

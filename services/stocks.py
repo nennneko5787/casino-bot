@@ -16,8 +16,8 @@ MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定、
 創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
 自社株は買増不可・売却のみ可。
-開始価格割れ + 下落継続で危険水域に入り、下落したまま6時間続いた会社は
-破産 (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
+開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
+会社は破産 (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
 元オーナーは再設立可。下落が止まって1時間続くか、開始価格以上に
 回復すれば水域から脱出する。
 """
@@ -202,13 +202,19 @@ def _row_to_stock(row) -> Stock:
     )
 
 
+def danger_threshold(start_price: int) -> int:
+    """危険ライン (開始価格の50%)。開始価格1の銘柄は価格1で危機。"""
+    start = start_price if start_price > 0 else 1
+    return max(start // 2, 1)
+
+
 def danger_info(stock: Stock, now: datetime | None = None) -> tuple[bool, float]:
     """危険水域の状態を返す (水域内か, 突入からの経過時間h)。
 
-    表示用 (/stock list・chart)。水域 = 開始価格割れ (開始価格1は価格1以下)。
+    表示用 (/stock list・chart)。水域 = 危険ライン (開始価格の50%) 以下。
     """
     start = stock.start_price if stock.start_price > 0 else 1
-    if not stock.floor_since or not (stock.price < start or stock.price <= 1):
+    if not stock.floor_since or stock.price > danger_threshold(start):
         return False, 0.0
     try:
         since = datetime.fromisoformat(stock.floor_since)
@@ -364,15 +370,16 @@ def dampen_impact_rate(raw_rate: float) -> float:
 async def tick_once(
     rng: random.Random | None = None,
     now: datetime | None = None,
-) -> tuple[list[Stock], list[dict], list[dict]]:
+) -> tuple[list[Stock], list[dict], list[dict], list[dict]]:
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
 
-    開始価格割れ + 下落継続で危険水域に入り、下落したまま6時間続いた会社は
-    破産させる (運営・ユーザー問わず)。下落が止まって1時間続くか、
+    開始価格の50%割れ + 下落継続で危険水域に入り、下落したまま6時間続いた
+    会社は破産させる (運営・ユーザー問わず)。下落が止まって1時間続くか、
     開始価格以上に回復すれば水域から脱出する。
     値上がりしたユーザー企業には創業者配当を付与する。
     戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id}],
-    危険水域突入の警告 [{ticker, owner_id, start_price, price}])。
+    危険水域突入の警告 [{ticker, owner_id, start_price, threshold, price}],
+    危険水域脱出 [{ticker, owner_id, price}])。
     """
     rng = rng or random.Random()
     moment = now or datetime.now(UTC)
@@ -381,6 +388,7 @@ async def tick_once(
     updated: list[Stock] = []
     bankrupted: list[dict] = []
     warned: list[dict] = []
+    escaped: list[dict] = []
     for stock in stocks:
         try:
             # DBに既に入っている異常値 (上限超え) はまず上限に丸めて回復させる
@@ -394,8 +402,8 @@ async def tick_once(
             logger.exception("株価tickの計算に失敗 ticker=%s", stock.ticker)
             continue
         start = stock.start_price if stock.start_price > 0 else 1
-        # 開始価格1の銘柄は価格1以下で水域入りする
-        in_danger = new_price < start or new_price <= 1
+        # 危険ライン (開始価格の50%) 以下で水域入りする
+        in_danger = new_price <= danger_threshold(start)
         if in_danger and not stock.floor_since:
             # 危険水域に突入: 時刻を記録して警告する
             floor_new: str | None = now_iso
@@ -404,12 +412,21 @@ async def tick_once(
                     "ticker": stock.ticker,
                     "owner_id": stock.owner_id,
                     "start_price": start,
+                    "threshold": danger_threshold(start),
                     "price": new_price,
                 }
             )
         elif not in_danger:
             # 開始価格以上に回復: 水域から脱出
             floor_new = None
+            if stock.floor_since:
+                escaped.append(
+                    {
+                        "ticker": stock.ticker,
+                        "owner_id": stock.owner_id,
+                        "price": new_price,
+                    }
+                )
         else:
             # 水域継続: 下落が続いたまま猶予超過なら破産。
             # 下落が止まってしばらく (TREND_CALM_HOURS) したら脱出する。
@@ -426,6 +443,13 @@ async def tick_once(
                 continue
             if not declining and age >= timedelta(hours=TREND_CALM_HOURS):
                 floor_new = None  # 下がり止まり → 脱出
+                escaped.append(
+                    {
+                        "ticker": stock.ticker,
+                        "owner_id": stock.owner_id,
+                        "price": new_price,
+                    }
+                )
         await DBService.pool.execute(
             "UPDATE stocks SET price = ?, floor_since = ?, updated_at = ? "
             "WHERE ticker = ?",
@@ -477,7 +501,7 @@ async def tick_once(
         (HISTORY_KEEP,),
     )
     await DBService.pool.commit()
-    return updated, bankrupted, warned
+    return updated, bankrupted, warned, escaped
 
 
 async def go_bankrupt(ticker: str) -> dict:
