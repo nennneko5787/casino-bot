@@ -36,7 +36,10 @@ logger = logging.getLogger(__name__)
 BAR_WIDTH = 12
 MEDALS = ["🥇", "🥈", "🥉"]
 
-logChannel = os.environ["log_channel"]
+def _log_channel_id() -> int | None:
+    """envのlog_channelをint化。未設定・不正値はNone。"""
+    raw = os.environ.get("log_channel", "").strip()
+    return int(raw) if raw.isdigit() else None
 
 
 async def _avatar_bytes(member: discord.Member | discord.User) -> bytes | None:
@@ -59,6 +62,9 @@ async def _send_levelup(
     repaid: int = 0,
 ) -> None:
     """レベルアップ通知を画像で送る。失敗時はEmbedにフォールバック。"""
+    if sendable is None:
+        logger.warning("レベルアップ通知先チャンネルが取得できませんでした")
+        return
     mention = getattr(member, "mention", None) or str(member)
     name = getattr(member, "display_name", str(member))
     try:
@@ -171,12 +177,20 @@ class LevelCog(commands.Cog):
                 reward, repaid = 0, 0
         return reward, repaid
 
-    def _notify_channel(
+    async def _notify_channel(
         self, guild: discord.Guild | None
-    ) -> discord.TextChannel | None:
+    ) -> discord.abc.Messageable | None:
+        """レベルアップ通知先。キャッシュになければfetchする。"""
         if guild is None:
             return None
-        return guild.get_channel(logChannel)
+        cid = _log_channel_id()
+        if cid is None:
+            return None
+        ch = guild.get_channel(cid)
+        if ch is None:
+            with suppress(discord.DiscordException):
+                ch = await guild.fetch_channel(cid)
+        return ch
 
     # ---------- リスナー ----------
 
@@ -202,8 +216,9 @@ class LevelCog(commands.Cog):
             return
         if new > old:
             with suppress(Exception):
+                ch = await self._notify_channel(message.guild)
                 await _send_levelup(
-                    message.guild.get_channel(logChannel), message.author, old, new, gained, reward, repaid
+                    ch, message.author, old, new, gained, reward, repaid
                 )
 
     @commands.Cog.listener("on_voice_state_update")
@@ -244,9 +259,8 @@ class LevelCog(commands.Cog):
             return
         if new > old and member.guild is not None:
             with suppress(Exception):
-                ch = self._notify_channel(member.guild)
-                if ch is not None:
-                    await _send_levelup(ch, member, old, new, gained, reward, repaid)
+                ch = await self._notify_channel(member.guild)
+                await _send_levelup(ch, member, old, new, gained, reward, repaid)
 
     @tasks.loop(minutes=5.0)
     async def vc_flush(self):
@@ -270,7 +284,7 @@ class LevelCog(commands.Cog):
                         member = guild.get_member(user_id)
                         if member is None:
                             continue
-                        ch = self._notify_channel(guild)
+                        ch = await self._notify_channel(guild)
                         if ch is None:
                             continue
                         await _send_levelup(
