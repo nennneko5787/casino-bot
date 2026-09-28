@@ -4,7 +4,8 @@
 (mu/sigma/impact) の中で5分ごとにパラメータが再抽選される。
 mu/sigma/impact の個別指定はできない (create/add/paramsでの指定は廃止)。
 
-倒産はHP制 + 追証制: 下落tickでHPが減り (1%下落→1.5HP)、上昇tickで回復する。
+倒産はHP制 + 追証制: 50tick前の価格を下回るとHPが減り
+(下落率×1.5、1tick最大10)、上回ると回復する。
 HPが尽きた (0になった) ときだけ設立者に通知し、0のまま48時間が経過したら
 破産する (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
 元オーナーは再設立可。警告ライン超まで回復すれば危機から脱出するが、
@@ -62,6 +63,11 @@ HP_RECOVER_PER_PCT = 2.0
 RESCUE_HP_PER_100 = 10.0
 RESCUE_HOURS = 48.0
 ZERO_GRACE_HOURS = 48.0
+
+# HP増減の基準は N tick前の価格 (直前tick比だとノイズで削れすぎるため)。
+HP_BASELINE_TICKS = 50
+# 1tickあたりのHP増減の上限 (安値銘柄の粒度による一撃死を防ぐ)。
+HP_MAX_DELTA_PER_TICK = 10
 
 # パラメータ再抽選の間隔 (tick回数。tick=1分のため5tick=5分ごと)。
 RANDOMIZE_EVERY_TICKS = 5
@@ -577,16 +583,43 @@ async def randomize_params(
     return updated
 
 
-def hp_after(market: Market, hp: int, old_price: int, new_price: int) -> int:
-    """1tick分のHP増減。下落で減・上昇で回復。0〜hp_maxに丸める。"""
-    if new_price == old_price or old_price < 1:
+def hp_after(market: Market, hp: int, baseline: int | None, new_price: int) -> int:
+    """1tick分のHP増減。基準は baseline (HP_BASELINE_TICKS tick前の価格)。
+
+    下回れば減・上回れば回復。1tickの増減は上限で丸め、0〜hp_maxに収める。
+    baseline が None (履歴なし) なら増減しない。
+    """
+    if baseline is None or baseline < 1:
         return max(0, min(hp, market.hp_max))
-    pct = (new_price - old_price) / old_price * 100.0
-    if pct < 0:
-        delta = pct * market.dmg_per_pct
-    else:
-        delta = pct * market.recover_per_pct
+    if new_price == baseline:
+        return max(0, min(hp, market.hp_max))
+    pct = (new_price - baseline) / baseline * 100.0
+    rate = market.dmg_per_pct if pct < 0 else market.recover_per_pct
+    delta = max(-HP_MAX_DELTA_PER_TICK, min(HP_MAX_DELTA_PER_TICK, pct * rate))
     return max(0, min(market.hp_max, int(hp + delta)))
+
+
+async def get_baseline_price(
+    ticker: str, lookback: int = HP_BASELINE_TICKS
+) -> int | None:
+    """lookback tick前の価格。履歴不足時は最古行、履歴なしはNone。"""
+    cursor = await DBService.pool.execute(
+        "SELECT price FROM stock_history WHERE ticker = ? "
+        "ORDER BY id DESC LIMIT 1 OFFSET ?",
+        (ticker, max(lookback - 1, 0)),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if row is not None:
+        return int(row["price"])
+    cursor = await DBService.pool.execute(
+        "SELECT price FROM stock_history WHERE ticker = ? "
+        "ORDER BY id ASC LIMIT 1",
+        (ticker,),
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return int(row["price"]) if row is not None else None
 
 
 def rescue_hp_for(market: Market, amount: int) -> int:
@@ -747,7 +780,8 @@ async def tick_once(
 ) -> tuple[list[Stock], list[dict], list[dict]]:
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
 
-    HP制 + 追証制: 下落tickでHPが減り、上昇tickで回復する。
+    HP制 + 追証制: 50tick前の価格を下回るとHPが減り、上回ると回復する
+    (1tickの増減は上限あり)。
     危機入り・脱出の通知は行わない。HPが初めて0になったtickで
     crisis_since を現在時刻に付け替え (0起点の計測開始)、
     0のまま猶予時間 (zero_grace_hours) が経過したら破産させる
@@ -781,7 +815,8 @@ async def tick_once(
             # 1銘柄の計算失敗で全体を止めない
             logger.exception("株価tickの計算に失敗 ticker=%s", stock.ticker)
             continue
-        new_hp = hp_after(market, stock.hp, stock.price, new_price)
+        baseline = await get_baseline_price(stock.ticker)
+        new_hp = hp_after(market, stock.hp, baseline, new_price)
         crisis_new = stock.crisis_since
         if new_hp <= 0 and stock.hp > 0:
             # HPが尽きた: 0起点の計測を開始して1回だけ通知する。
