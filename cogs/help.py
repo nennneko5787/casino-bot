@@ -132,7 +132,8 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     stock.add_field(
         name="/stock create [銘柄] [投資額]",
-        value="会社を設立 (1人1社)。投資額でランク・条件が決まり、創業者株 (売却のみ可) が付く。"
+        value="会社を設立 (レベル連動枠: 10Lvごとに+1社・上限5社)。投資額でランク・条件が決まり、創業者株 (売却のみ可) が付く。"
+        " `/stock invest` で自社に追加投資 (時価で創業者株を発行) も可能"
         "他人の売買でロイヤリティ1%、値上がりで保有株数連動の配当が入る",
         inline=False,
     )

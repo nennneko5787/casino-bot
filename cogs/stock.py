@@ -1,9 +1,9 @@
 """株価: 売買 + 会社設立 + 折れ線チャート + 管理者の銘柄追加。
 
-一般: /stock buy|sell|create|retire|reopen|chart|currency|portfolio|list
+一般: /stock buy|sell|create|invest|retire|reopen|chart|currency|portfolio|list
 管理者: /stock-admin add|delist|relist|params|set-price
 
-会社は1人1社まで (設立手数料1000+投資金、開始株価=投資金、
+会社はレベル連動枠 (10Lvごとに+1社・上限5社、設立手数料1000+投資金、開始株価=投資金、
 mu/sigma/impactは投資額ランクで自動決定、
 創業者株+売買ロイヤリティ+値上がり配当あり)。
 自社株は買増不可・売却のみ可。
@@ -111,7 +111,7 @@ class StockCog(commands.Cog):
     async def stock(self, ctx: commands.Context):
         await ctx.reply(
             "サブコマンドを指定してください: "
-            "buy / sell / create / retire / reopen / chart / currency / "
+            "buy / sell / create / invest / retire / reopen / chart / currency / "
             "portfolio / list",
             ephemeral=True,
         )
@@ -379,7 +379,7 @@ class StockCog(commands.Cog):
             )
         )
 
-    @stock.command(name="create", brief="会社を設立します (1人1社)")
+    @stock.command(name="create", brief="会社を設立します (レベルで枠増加)")
     @app_commands.rename(ticker="銘柄", invest="投資額")
     @app_commands.describe(
         ticker="英数字1〜15文字 (例: MYCO)",
@@ -401,8 +401,29 @@ class StockCog(commands.Cog):
             raise AmountNotEnough()
         rank = stocks.rank_for_invest(invest)
         founder_shares = stocks.founder_shares_for(invest)
+        from services import levels as level_service
+        from services.database import DBService
+
+        user_level = 1
+        with suppress(Exception):  # レベル取得失敗時はLv.1扱いで継続
+            user_level = int((await level_service.get_info(ctx.author.id))["level"])
+        limit = stocks.max_companies_for_level(user_level)
+        cursor = await DBService.pool.execute(
+            "SELECT COUNT(*) AS n FROM stocks WHERE owner_id = ?",
+            (ctx.author.id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        owned = int(row["n"]) if row else 0
+        rest = limit - owned
+        nxt = stocks.next_slot_level(user_level)
+        if rest > 0:
+            slot_note = f" (Lv.{user_level}: あと{rest}社建てられます"
+            slot_note += f"・Lv.{nxt}で次の枠解放)" if nxt else "・上限到達)"
+        else:
+            slot_note = ""
         await ctx.reply(
-            f"🏢 `{stock.ticker}` を設立しました！\n"
+            f"🏢 `{stock.ticker}` を設立しました！{slot_note}\n"
             f"設立費用: {buildAmountText(stocks.FOUNDING_FEE + invest)}"
             f" (手数料{buildAmountText(stocks.FOUNDING_FEE)}"
             f"＋投資{buildAmountText(invest)})\n"
@@ -414,6 +435,38 @@ class StockCog(commands.Cog):
             "※他人が自社株を売買するたび、代金の1%がロイヤリティで入ります\n"
             "※株価が上がると、上昇分×保有株数×0.1%が配当で入ります (株を持ち続けるほどお得)\n"
             "※自分の会社の株の買増はできません"
+        )
+
+    @stock.command(name="invest", brief="自分の会社に追加投資します (増資)")
+    @app_commands.rename(ticker="銘柄", invest="投資額")
+    @app_commands.describe(
+        ticker="自分の会社の銘柄",
+        invest="追加投資額 (1以上)。現在の株価で創業者株を発行します",
+    )
+    @app_commands.autocomplete(ticker=ticker_autocomplete)
+    @commands.guild_only()
+    async def stockInvestCommand(
+        self,
+        ctx: commands.Context,
+        ticker: str,
+        invest: int,
+    ):
+        try:
+            stock, new_shares = await stocks.add_investment(
+                ctx.author.id, ticker, invest
+            )
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        except LookupError:
+            raise AmountNotEnough()
+        with suppress(Exception):
+            await missions.record_event(ctx.author.id, "trade")
+        await ctx.reply(
+            f"💰 `{stock.ticker}` に追加投資しました！\n"
+            f"投資額: {buildAmountText(invest)}\n"
+            f"発行株数: {new_shares}株 @ {buildAmountText(stock.price)}\n"
+            "※株価は変わりません (時価増資のため)"
         )
 
     @stock.command(name="retire", brief="自分の会社を取扱停止します")

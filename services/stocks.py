@@ -12,7 +12,7 @@ mu/sigma は管理者が数値で直接指定できる (原案) ほか、
 少量ならほぼ線形 (impact × 数量) に動くが、大量注文でも
 MAX_TRADE_IMPACT (既定±3%) を超えて動くことはない。
 
-ユーザーは会社を設立できる (1人1社、設立手数料1000+投資金、
+ユーザーは会社を設立できる (レベル連動枠、設立手数料1000+投資金、
 開始株価=投資金、mu/sigma/impactは投資額ランクで自動決定、
 創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
 自社株は買増不可・売却のみ可。
@@ -26,6 +26,7 @@ import logging
 import math
 import random
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -575,6 +576,28 @@ def founder_shares_for(invest: int) -> int:
     return max(invest // FOUNDER_SHARES_PER, 1)
 
 
+# レベル連動の会社保有枠: 10Lvごとに+1社 (Lv1〜9:1社、Lv10〜19:2社…)、上限5社。
+COMPANY_SLOT_STEP = 10
+MAX_COMPANIES = 5
+
+
+def max_companies_for_level(level: int) -> int:
+    """レベルに対応する会社保有上限。1未満は1社扱い。
+
+    10Lvごとに+1社 (Lv1〜9:1社、Lv10〜19:2社…)、上限5社。
+    """
+    level = max(int(level), 1)
+    return min(1 + level // COMPANY_SLOT_STEP, MAX_COMPANIES)
+
+
+def next_slot_level(level: int) -> int | None:
+    """次の会社枠が解放されるレベル。上限到達済みならNone。"""
+    slots = max_companies_for_level(level)
+    if slots >= MAX_COMPANIES:
+        return None
+    return slots * COMPANY_SLOT_STEP
+
+
 async def _credit_royalty(owner_id: int | None, base: int) -> int:
     """売買ロイヤリティ (代金×ROYALTY_RATE) を設立者に付与。戻り値は付与額。
 
@@ -638,7 +661,7 @@ async def create_company(
     ticker: str,
     invest: int,
 ) -> Stock:
-    """ユーザー用: 会社を設立 (1人1社)。設立手数料1000+投資金を徴収。
+    """ユーザー用: 会社を設立 (レベル連動枠)。設立手数料1000+投資金を徴収。
 
     開始株価=投資金。mu/sigma/impactは投資額ランクで自動決定され、
     指定はできない (管理者の add/params のみ数値・プリセット指定可)。
@@ -646,6 +669,8 @@ async def create_company(
     戻り値は設立した銘柄。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     """
+    from services import levels as level_service
+
     ticker = normalize_ticker(ticker)
     if invest < 1:
         raise ValueError("投資額は1以上にしてください")
@@ -653,13 +678,20 @@ async def create_company(
         raise ValueError(f"投資額は{MAX_PRICE:,}以下にしてください")
     if await get_stock(ticker):
         raise ValueError(f"{ticker} は既に存在します")
+    user_level = 1
+    with suppress(Exception):  # レベル取得失敗時はLv.1扱いで継続
+        user_level = int((await level_service.get_info(user_id))["level"])
+    limit = max_companies_for_level(user_level)
     cursor = await DBService.pool.execute(
-        "SELECT 1 FROM stocks WHERE owner_id = ?", (user_id,)
+        "SELECT COUNT(*) AS n FROM stocks WHERE owner_id = ?", (user_id,)
     )
-    own = await cursor.fetchone()
+    row = await cursor.fetchone()
     await cursor.close()
-    if own:
-        raise ValueError("会社は1人1社までです")
+    owned = int(row["n"]) if row else 0
+    if owned >= limit:
+        nxt = next_slot_level(user_level)
+        extra = f" (Lv.{nxt}で次の枠が解放されます)" if nxt else " (上限です)"
+        raise ValueError(f"Lv.{user_level}では会社は{limit}社までです{extra}")
     cost = FOUNDING_FEE + invest
     cursor = await DBService.pool.execute(
         "SELECT * FROM users WHERE id = ?", (user_id,)
@@ -700,6 +732,80 @@ async def create_company(
     stock = await get_stock(ticker)
     assert stock is not None
     return stock
+
+
+async def add_investment(
+    user_id: int,
+    ticker: str,
+    invest: int,
+) -> tuple[Stock, int]:
+    """設立者用: 自分の会社に追加投資 (増資) する。
+
+    投資額の全額を支払い、現在の株価で創業者株を発行する
+    (発行株数 = 投資額 // 株価)。株価自体は変わらない
+    (時価増資・希薄化で中立のため、錬金にならない)。
+    mu/sigma/impact は変わらない。
+    戻り値は (銘柄, 発行株数)。
+    残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
+    """
+    ticker = normalize_ticker(ticker)
+    if invest < 1:
+        raise ValueError("投資額は1以上にしてください")
+    if invest > MAX_PRICE:
+        raise ValueError(f"投資額は{MAX_PRICE:,}以下にしてください")
+    stock = await get_stock(ticker)
+    if not stock:
+        raise ValueError(f"{ticker} は存在しません")
+    if stock.owner_id != user_id:
+        raise ValueError(f"{ticker} はあなたの会社ではありません")
+    new_shares = invest // stock.price
+    if new_shares < 1:
+        raise ValueError(
+            f"投資額が株価 ({stock.price:,}) に満たないため1株も発行できません"
+        )
+    cursor = await DBService.pool.execute(
+        "SELECT * FROM users WHERE id = ?", (user_id,)
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row:
+        await DBService.pool.execute("INSERT INTO users(id) VALUES (?)", (user_id,))
+        await DBService.pool.commit()
+        balance = 100
+    else:
+        balance = row["amount"]
+    if balance < invest:
+        raise LookupError(f"残高不足: 必要 {invest}")
+    cursor = await DBService.pool.execute(
+        "SELECT qty, avg_cost FROM holdings WHERE user_id = ? AND ticker = ?",
+        (user_id, ticker),
+    )
+    holding = await cursor.fetchone()
+    await cursor.close()
+    old_qty = holding["qty"] if holding else 0
+    old_avg = holding["avg_cost"] if holding else 0
+    total_qty = old_qty + new_shares
+    if total_qty > SQLITE_MAX_INT:
+        raise ValueError("発行後の保有株数が上限を超えます")
+    new_avg = (old_avg * old_qty + invest) // total_qty
+    await DBService.pool.execute(
+        "UPDATE users SET amount = amount - ? WHERE id = ?", (invest, user_id)
+    )
+    if holding:
+        await DBService.pool.execute(
+            "UPDATE holdings SET qty = ?, avg_cost = ? "
+            "WHERE user_id = ? AND ticker = ?",
+            (total_qty, new_avg, user_id, ticker),
+        )
+    else:
+        await DBService.pool.execute(
+            "INSERT INTO holdings (user_id, ticker, qty, avg_cost) VALUES (?, ?, ?, ?)",
+            (user_id, ticker, new_shares, new_avg),
+        )
+    await DBService.pool.commit()
+    stock = await get_stock(ticker)
+    assert stock is not None
+    return stock, new_shares
 
 
 async def update_params(
