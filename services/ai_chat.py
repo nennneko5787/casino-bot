@@ -11,8 +11,9 @@
   AI接続失敗時は徴収済み料金を返金する。
 - OpenRouterのsafetySettingsは送ると400になるため送らない。
   Gemini側は HarmCategory を BLOCK_ONLY_HIGH に緩めてRP誤爆を減らす。
-- 出力上限は env OPENROUTER_MAX_TOKENS / GEMINI_MAX_TOKENS で指定する。
-  長さ制限で切れた応答には「つづき」を促す注記を付ける (履歴には生本文のみ保存)。
+- 出力の長さ制限は設けない (プロバイダ既定に任せる)。
+  万が一長さ制限で切れた応答には「つづき」を促す注記を付ける
+  (履歴には生本文のみ保存)。
 - ユーザー毎に履歴保持 (直近 HISTORY_KEEP 件)。/ai clear で削除可。
 - system指示は管理者既定 + ユーザー別persona上書き。
 """
@@ -48,8 +49,6 @@ GEMINI_API_URL = os.environ.get(
     "GEMINI_API_URL", "https://generativelanguage.googleapis.com/v1beta"
 )
 GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "1.0"))
-GEMINI_MAX_TOKENS = int(os.environ.get("GEMINI_MAX_TOKENS", "512"))
-OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "2048"))
 GEMINI_SAFETY_THRESHOLD = os.environ.get("GEMINI_SAFETY_THRESHOLD", "BLOCK_ONLY_HIGH")
 # 無料枠防御: 日次上限 (余裕を見て定格1000より少なめ) と全体RPM間隔。
 GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", "900"))
@@ -509,7 +508,6 @@ def _gemini_payload(
         "contents": contents,
         "generationConfig": {
             "temperature": GEMINI_TEMPERATURE,
-            "maxOutputTokens": GEMINI_MAX_TOKENS,
         },
         "safetySettings": [
             {"category": cat, "threshold": GEMINI_SAFETY_THRESHOLD}
@@ -598,7 +596,7 @@ async def openrouter_ask(
     messages = [{"role": "system", "content": system}]
     messages += history
     messages.append({"role": "user", "content": text})
-    payload = {"model": model, "messages": messages, "max_tokens": OPENROUTER_MAX_TOKENS}
+    payload = {"model": model, "messages": messages}
     try:
         raw = await asyncio.to_thread(_post, payload)
     except ValueError:
