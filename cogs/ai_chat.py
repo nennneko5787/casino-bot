@@ -90,7 +90,7 @@ class AiCog(commands.Cog):
         await ctx.reply(
             f"AIチャット料金: {buildAmountText(price)} /往復\n"
             f"(通貨価値指数 {index:.1f} 連動: 指数が低い=通貨安ほど高額)\n"
-            f"モデル: `{ai.resolve_model()}`",
+            f"モデル: `{await ai.resolve_model()}`",
             ephemeral=True,
         )
 
@@ -128,7 +128,7 @@ class AiCog(commands.Cog):
     @commands.guild_only()
     async def aiAdmin(self, ctx: commands.Context):
         await ctx.reply(
-            "サブコマンドを指定してください: system",
+            "サブコマンドを指定してください: system / model",
             ephemeral=True,
         )
 
@@ -148,6 +148,26 @@ class AiCog(commands.Cog):
             return
         await ai.set_global_system(text)
         await ctx.reply("全体既定のRP指示を設定しました", ephemeral=True)
+
+    @aiAdmin.command(name="model", brief="※管理者専用 モデルを確認・変更します")
+    @app_commands.describe(text="空にすると現在の設定を表示。ID指定で即時切替")
+    @admin_only()
+    @commands.guild_only()
+    async def aiAdminModelCommand(self, ctx: commands.Context, *, text: str = ""):
+        text = text.strip()
+        if not text:
+            cur = await ai.resolve_model()
+            await ctx.reply(
+                f"モデル: `{cur}`\nID指定で再起動なしに切り替えられます",
+                ephemeral=True,
+            )
+            return
+        try:
+            await ai.set_model(text)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(f"モデルを `{text}` に切り替えました", ephemeral=True)
 
     @commands.Cog.listener("on_message")
     async def onMessage(self, message: discord.Message):

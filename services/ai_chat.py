@@ -1,10 +1,13 @@
 """AIチャット: OpenRouter経由のロールプレイチャット。
 
-- モデルは env OPENROUTER_MODEL (既定 qwen/qwen3.8-27b:free) で固定。
-  変更は `.env` を書き換えて再起動する (コマンドからの切替は不可)。
+- モデルは DB設定 > env OPENROUTER_MODEL > 既定 openrouter/free の順で解決。
+  /ai-admin model (管理者限定) で再起動なしに切り替えられる。
 - 料金は固定×通貨価値指数連動: price = ceil(BASE * 100 / index)。
   通貨安(指数低)→高額、通貨高→割安。残高不足は LookupError。
   AI接続失敗時は徴収済み料金を返金する。
+- モデル側の安全判定ダンプのみの応答はエラー扱い (返金対象)。
+  ※OpenRouterのchat completionsはsafetySettingsを受け付けない
+  (送ると400) ため、安全設定の緩和は行わない。
 - ユーザー毎に履歴保持 (直近 HISTORY_KEEP 件)。/ai clear で削除可。
 - system指示は管理者既定 + ユーザー別persona上書き。
 """
@@ -16,6 +19,7 @@ import json
 import logging
 import math
 import os
+import re
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime
@@ -28,7 +32,7 @@ dotenv.load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "qwen/qwen3.8-27b:free"
+DEFAULT_MODEL = "openrouter/free"
 MODEL = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 API_URL = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -209,9 +213,45 @@ async def set_global_system(prompt: str) -> None:
     await DBService.pool.commit()
 
 
-def resolve_model() -> str:
-    """モデルIDを返す。変更は `.env` の `OPENROUTER_MODEL` で行う。"""
-    return MODEL
+async def get_model() -> str | None:
+    """DBに保存されたモデルID。未設定ならNone。"""
+    await ensure_tables()
+    cursor = await DBService.pool.execute(
+        "SELECT value FROM ai_global WHERE key = 'model'"
+    )
+    row = await cursor.fetchone()
+    await cursor.close()
+    return row["value"] if row else None
+
+
+async def set_model(model: str) -> None:
+    """モデルIDをDBに保存 (再起動なしで切替、管理者限定コマンド用)。"""
+    model = model.strip()
+    if not model:
+        raise ValueError("モデルIDを入力してください")
+    await ensure_tables()
+    await DBService.pool.execute(
+        "INSERT INTO ai_global (key, value) VALUES ('model', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (model[:200],),
+    )
+    await DBService.pool.commit()
+
+
+async def resolve_model() -> str:
+    """DB設定 > env > 既定 の順でモデルIDを解決。"""
+    db = await get_model()
+    return db or MODEL
+
+
+def is_safety_dump(reply: str) -> bool:
+    """モデル側の安全判定ダンプのみの応答か。通常の雑談に両マーカーは出ない。"""
+    low = reply.lower()
+    if "user safety" not in low or "response safety" not in low:
+        return False
+    rest = re.sub(r"user safety|response safety", "", low)
+    rest = re.sub(r"[^a-z]", "", rest)
+    return rest in ("safe", "safesafe") or len(rest) < 10
 
 
 async def resolve_system(user_id: int) -> str:
@@ -290,7 +330,7 @@ async def ask(user_id: int, text: str) -> str:
     messages = [{"role": "system", "content": system}]
     messages += history
     messages.append({"role": "user", "content": text})
-    payload = {"model": resolve_model(), "messages": messages}
+    payload = {"model": await resolve_model(), "messages": messages}
     try:
         raw = await asyncio.to_thread(_post, payload)
     except ValueError:
@@ -299,11 +339,16 @@ async def ask(user_id: int, text: str) -> str:
         raise ValueError(f"AIへの接続に失敗しました ({e})") from e
     try:
         data = json.loads(raw)
-        reply = data["choices"][0]["message"]["content"].strip()
+        reply = (data["choices"][0]["message"].get("content") or "").strip()
     except (KeyError, IndexError, ValueError, AttributeError) as e:
         raise ValueError("AIの応答を解釈できませんでした") from e
     if not reply:
         raise ValueError("AIから空の応答が返りました")
+    if is_safety_dump(reply):
+        logger.warning("AI safety dump (user=%s model=%s)", user_id, payload["model"])
+        raise ValueError(
+            "AIが安全判定のみを返しました。別の言い方で試してね"
+        )
     await append_history(user_id, "user", text)
     await append_history(user_id, "assistant", reply)
     return reply

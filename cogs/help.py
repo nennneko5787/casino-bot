@@ -165,7 +165,7 @@ def build_help_embeds() -> list[discord.Embed]:
         inline=False,
     )
     money.add_field(
-        name="/ranking / /poor-ranking",
+        name="/ranking net / poor",
         value="総資産 (残高 + 株評価額 − 借金) の上位 / 下位を表示",
         inline=False,
     )
@@ -222,7 +222,7 @@ def build_help_embeds() -> list[discord.Embed]:
         inline=False,
     )
     level.add_field(
-        name="/level-ranking",
+        name="/ranking level",
         value="XP上位10名のレベル番付を表示",
         inline=False,
     )
