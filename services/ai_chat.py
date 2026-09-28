@@ -1,7 +1,7 @@
 """AIチャット: Gemini (主) + OpenRouter (予備) のロールプレイチャット。
 
 - モデルは DB設定 > env > 既定 gemini-2.5-flash-lite の順で解決。
-  `gemini-` で始まるIDはGemini、他はOpenRouterで叩く。
+  `gemini-` / `gemma-` で始まるIDはGemini API、他はOpenRouterで叩く。
   /ai-admin model (管理者限定) で再起動なしに切り替えられる。
 - Gemini無料枠を守るため、日次カウンタ (太平洋時間0時リセット) と
   全体RPMスロットル (最小間隔) を持つ。上限到達・429時はその日
@@ -11,6 +11,8 @@
   AI接続失敗時は徴収済み料金を返金する。
 - OpenRouterのsafetySettingsは送ると400になるため送らない。
   Gemini側は HarmCategory を BLOCK_ONLY_HIGH に緩めてRP誤爆を減らす。
+- 出力上限は env OPENROUTER_MAX_TOKENS / GEMINI_MAX_TOKENS で指定する。
+  長さ制限で切れた応答には「つづき」を促す注記を付ける (履歴には生本文のみ保存)。
 - ユーザー毎に履歴保持 (直近 HISTORY_KEEP 件)。/ai clear で削除可。
 - system指示は管理者既定 + ユーザー別persona上書き。
 """
@@ -47,6 +49,7 @@ GEMINI_API_URL = os.environ.get(
 )
 GEMINI_TEMPERATURE = float(os.environ.get("GEMINI_TEMPERATURE", "1.0"))
 GEMINI_MAX_TOKENS = int(os.environ.get("GEMINI_MAX_TOKENS", "512"))
+OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "2048"))
 GEMINI_SAFETY_THRESHOLD = os.environ.get("GEMINI_SAFETY_THRESHOLD", "BLOCK_ONLY_HIGH")
 # 無料枠防御: 日次上限 (余裕を見て定格1000より少なめ) と全体RPM間隔。
 GEMINI_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", "900"))
@@ -266,16 +269,16 @@ async def resolve_model() -> str:
     return db or MODEL
 
 
-def is_gemini_model(model: str) -> bool:
-    """Geminiで叩くべきモデルIDか。"""
+def is_gemini_api_model(model: str) -> bool:
+    """Gemini APIで叩くべきモデルIDか。Gemini系とGemma系が対象。"""
     m = model.strip().lower()
-    return m.startswith(("gemini-", "models/"))
+    return m.startswith(("gemini-", "gemma-", "models/"))
 
 
 async def resolve_openrouter_model() -> str:
-    """フォールバック用のOpenRouterモデルID。DB値がGemini系ならenv/既定を使う。"""
+    """フォールバック用のOpenRouterモデルID。DB値がGemini API系ならenv/既定を使う。"""
     db = await get_model()
-    if db and not is_gemini_model(db):
+    if db and not is_gemini_api_model(db):
         return db
     return OPENROUTER_MODEL
 
@@ -518,8 +521,11 @@ def _gemini_payload(
     return payload
 
 
-def _gemini_parse(raw: str) -> str:
-    """generateContent応答から本文を抜き出す。安全ブロックは ValueError。"""
+def _gemini_parse(raw: str) -> tuple[str, bool]:
+    """generateContent応答から本文を抜き出す。戻り値は (本文, 長さ制限で切れたか)。
+
+    安全ブロックは ValueError。
+    """
     try:
         data = json.loads(raw)
     except ValueError as e:
@@ -529,7 +535,8 @@ def _gemini_parse(raw: str) -> str:
         if (feedback.get("blockReason") or "") not in ("", "BLOCK_REASON_UNSPECIFIED"):
             raise ValueError("AIが安全フィルタで止めました。別の言い方で試してね")
         candidate = (data.get("candidates") or [])[0]
-        if (candidate.get("finishReason") or "") == "SAFETY":
+        finish = candidate.get("finishReason") or ""
+        if finish == "SAFETY":
             raise ValueError("AIが安全フィルタで止めました。別の言い方で試してね")
         parts = (candidate.get("content") or {}).get("parts") or []
         reply = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
@@ -537,7 +544,7 @@ def _gemini_parse(raw: str) -> str:
         raise ValueError("AIの応答を解釈できませんでした") from e
     if not reply:
         raise ValueError("AIから空の応答が返りました")
-    return reply
+    return reply, finish == "MAX_TOKENS"
 
 
 async def refund(user_id: int, price: int) -> None:
@@ -556,8 +563,11 @@ async def refund(user_id: int, price: int) -> None:
 
 async def gemini_ask(
     model: str, system: str, history: list[dict], text: str
-) -> str:
-    """Geminiで1往復。429は GeminiThrottled、日次上限は GeminiDayExhausted。"""
+) -> tuple[str, bool]:
+    """Gemini APIで1往復。戻り値は (本文, 長さ制限で切れたか)。
+
+    429は GeminiThrottled、日次上限は GeminiDayExhausted。
+    """
     if not GEMINI_API_KEY:
         raise GeminiDayExhausted("GEMINI_API_KEY が未設定です")
     if await gemini_suspended():
@@ -579,8 +589,8 @@ async def gemini_ask(
 
 async def openrouter_ask(
     model: str, system: str, history: list[dict], text: str
-) -> str:
-    """OpenRouterで1往復。失敗は ValueError。"""
+) -> tuple[str, bool]:
+    """OpenRouterで1往復。戻り値は (本文, 長さ制限で切れたか)。失敗は ValueError。"""
     if not API_KEY:
         raise ValueError(
             "OPENROUTER_API_KEY が未設定です。管理者に連絡してください"
@@ -588,7 +598,7 @@ async def openrouter_ask(
     messages = [{"role": "system", "content": system}]
     messages += history
     messages.append({"role": "user", "content": text})
-    payload = {"model": model, "messages": messages}
+    payload = {"model": model, "messages": messages, "max_tokens": OPENROUTER_MAX_TOKENS}
     try:
         raw = await asyncio.to_thread(_post, payload)
     except ValueError:
@@ -597,7 +607,10 @@ async def openrouter_ask(
         raise ValueError(f"AIへの接続に失敗しました ({e})") from e
     try:
         data = json.loads(raw)
-        reply = (data["choices"][0]["message"].get("content") or "").strip()
+        choice = data["choices"][0]
+        message = choice.get("message") or {}
+        reply = (message.get("content") or "").strip()
+        truncated = choice.get("finish_reason") == "length"
     except (KeyError, IndexError, ValueError, AttributeError) as e:
         raise ValueError("AIの応答を解釈できませんでした") from e
     if not reply:
@@ -607,12 +620,20 @@ async def openrouter_ask(
         raise ValueError(
             "AIが安全判定のみを返しました。別の言い方で試してね"
         )
-    return reply
+    return reply, truncated
 
 
 async def _store_roundtrip(user_id: int, text: str, reply: str) -> None:
     await append_history(user_id, "user", text)
     await append_history(user_id, "assistant", reply)
+
+
+TRUNCATION_NOTE = "\n-# 応答が長いため途中で切れました。「つづき」と送ると続きを返します"
+
+
+def _with_truncation_note(reply: str, truncated: bool) -> str:
+    """長さ制限で切れていたら注記を付ける。履歴には生の本文だけ残すため呼出側で付与する。"""
+    return reply + TRUNCATION_NOTE if truncated else reply
 
 
 async def ask(user_id: int, text: str) -> tuple[str, bool]:
@@ -623,15 +644,15 @@ async def ask(user_id: int, text: str) -> tuple[str, bool]:
     system = await resolve_system(user_id)
     history = await get_history(user_id)
     model = await resolve_model()
-    if is_gemini_model(model) and await gemini_available():
+    if is_gemini_api_model(model) and await gemini_available():
         try:
-            reply = await gemini_ask(model, system, history, text)
-        except (GeminiThrottled, GeminiDayExhausted, ValueError):
-            pass
+            reply, truncated = await gemini_ask(model, system, history, text)
+        except (GeminiThrottled, GeminiDayExhausted, ValueError) as e:
+            logger.warning("Gemini利用不可のためフォールバックします: %s", e)
         else:
             await _store_roundtrip(user_id, text, reply)
-            return reply, False
+            return _with_truncation_note(reply, truncated), False
     fallback_model = await resolve_openrouter_model()
-    reply = await openrouter_ask(fallback_model, system, history, text)
+    reply, truncated = await openrouter_ask(fallback_model, system, history, text)
     await _store_roundtrip(user_id, text, reply)
-    return reply, is_gemini_model(model)
+    return _with_truncation_note(reply, truncated), is_gemini_api_model(model)

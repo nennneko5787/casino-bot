@@ -7,8 +7,9 @@
 銘柄は株式市場に所属し、市場ごとに値動きレンジ (mu/sigma/impact) と
 HP倒産ルールが違う。mu/sigma/impactは5分ごとに市場レンジ内で自動再抽選
 され、個別指定はできない (params廃止)。
-倒産はHP制 + 追証制: 下落でHPが減り、警告ライン以下で経営危機に入る。
-設立者が追証 (rescue) で回復しなければ破産 (保有株は紙くず・会社消去)。
+倒産はHP制 + 追証制: 下落でHPが減り、HPが尽きたときだけ設立者に通知する。
+0のまま48時間以内に追証 (rescue) で回復しなければ破産
+(保有株は紙くず・会社消去)。危機入り・脱出の全体通知は行わない。
 """
 
 import asyncio
@@ -256,7 +257,7 @@ class StockCog(commands.Cog):
         self._last_tick_at = now
         self._tick_count += 1
         try:
-            _, bankrupted, warned, escaped = await stocks.tick_once()
+            _, bankrupted, zeroed = await stocks.tick_once()
             # 5分ごとに mu/sigma/impact を市場レンジ内で再抽選する
             if self._tick_count % stocks.RANDOMIZE_EVERY_TICKS == 0:
                 with suppress(Exception):
@@ -264,20 +265,13 @@ class StockCog(commands.Cog):
         except Exception:
             logger.exception("株価の定期更新に失敗")
             return
-        for info in warned:
+        for info in zeroed:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
             await self._broadcast(
-                f"⚠️ `{info['ticker']}` が経営危機です"
-                f"（市場{info['market_id']}・HP {info['hp']}）\n"
+                f"🪫 `{info['ticker']}` のHPが尽きました"
+                f"（市場{info['market_id']}）\n"
                 f"設立者: {owner}／{info['deadline_hours']:g}時間以内に"
-                "`/stock rescue` で追証しなければ破産します"
-            )
-        for info in escaped:
-            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
-            await self._broadcast(
-                f"✅ `{info['ticker']}` が経営危機から脱出しました"
-                f"（市場{info['market_id']}・HP {info['hp']}）\n"
-                f"設立者: {owner}"
+                "`/stock rescue` で追証しなければ削除されます"
             )
         for info in bankrupted:
             owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
@@ -941,7 +935,7 @@ class StockCog(commands.Cog):
         impact_min="impact下限 (既定0.0002)",
         impact_max="impact上限 (既定0.0006)",
         warning_hp="経営危機に入るHP (既定30)",
-        rescue_hours="追証期限h (既定24)",
+        rescue_hours="追証期限h (既定48)",
     )
     async def stockMarketCreateCommand(
         self,
@@ -956,7 +950,7 @@ class StockCog(commands.Cog):
         impact_min: float = 0.0002,
         impact_max: float = 0.0006,
         warning_hp: int = 30,
-        rescue_hours: float = 24.0,
+        rescue_hours: float = 48.0,
     ):
         try:
             market = await stocks.create_market(

@@ -76,6 +76,16 @@ class AiCog(commands.Cog):
             first = await first.reply(part)
         return first
 
+    async def _reply_long_ctx(self, ctx: commands.Context, text: str):
+        """スラッシュ/プレフィックス両対応の長文分割送信。2000文字制限対策。"""
+        parts = _chunks(text)
+        await ctx.reply(parts[0])
+        for part in parts[1:]:
+            if ctx.interaction is not None:
+                await ctx.interaction.followup.send(part)
+            else:
+                await ctx.send(part)
+
     @commands.hybrid_group(name="ai", brief="AIチャットをします (有料)")
     @commands.guild_only()
     async def ai(self, ctx: commands.Context):
@@ -101,8 +111,9 @@ class AiCog(commands.Cog):
             await ctx.reply(f"{e}\n-# 料金は返金されました", ephemeral=True)
             return
         note = " (代替モデルで応答)" if fallback else ""
-        await ctx.reply(
-            f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動){note}"
+        await self._reply_long_ctx(
+            ctx,
+            f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動){note}",
         )
 
     @ai.command(name="price", brief="AIチャットの現在料金を表示します")

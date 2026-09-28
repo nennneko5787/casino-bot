@@ -26,17 +26,17 @@ SEED_MARKETS = [
     (
         "MEOWDAQ", "MEOWDAQ", "メインの穏やかな市場",
         -0.001, 0.002, 0.02, 0.05, 0.0002, 0.0006, 0.0005,
-        100, 30, 3.0, 2.0, 10.0, 24.0, 1.0,
+        100, 30, 1.5, 2.0, 10.0, 48.0, 48.0,
     ),
     (
         "AABOT", "AABOT", "値動きの荒い市場",
         -0.002, 0.003, 0.05, 0.10, 0.0005, 0.002, 0.001,
-        100, 30, 3.0, 2.0, 10.0, 24.0, 1.0,
+        100, 30, 1.5, 2.0, 10.0, 48.0, 48.0,
     ),
     (
         "OZETUDO", "OZETUDO", "値動きの鈍い安定市場",
         -0.0005, 0.001, 0.01, 0.03, 0.0001, 0.0003, 0.0002,
-        100, 30, 3.0, 2.0, 10.0, 24.0, 1.0,
+        100, 30, 1.5, 2.0, 10.0, 48.0, 48.0,
     ),
 ]
 
@@ -57,11 +57,11 @@ def upgrade() -> None:
         sa.Column("jitter", sa.REAL(), nullable=False, server_default="0"),
         sa.Column("hp_max", sa.INTEGER(), nullable=False, server_default="100"),
         sa.Column("warning_hp", sa.INTEGER(), nullable=False, server_default="30"),
-        sa.Column("dmg_per_pct", sa.REAL(), nullable=False, server_default="3.0"),
+        sa.Column("dmg_per_pct", sa.REAL(), nullable=False, server_default="1.5"),
         sa.Column("recover_per_pct", sa.REAL(), nullable=False, server_default="2.0"),
         sa.Column("rescue_hp_per_100", sa.REAL(), nullable=False, server_default="10.0"),
-        sa.Column("rescue_hours", sa.REAL(), nullable=False, server_default="24.0"),
-        sa.Column("zero_grace_hours", sa.REAL(), nullable=False, server_default="1.0"),
+        sa.Column("rescue_hours", sa.REAL(), nullable=False, server_default="48.0"),
+        sa.Column("zero_grace_hours", sa.REAL(), nullable=False, server_default="48.0"),
         sa.Column("mean_ref_price", sa.REAL(), nullable=True),
         sa.Column("mean_k", sa.REAL(), nullable=True),
         sa.Column("updated_at", sa.TEXT(), nullable=False),

@@ -4,11 +4,11 @@
 (mu/sigma/impact) の中で5分ごとにパラメータが再抽選される。
 mu/sigma/impact の個別指定はできない (create/add/paramsでの指定は廃止)。
 
-倒産はHP制 + 追証制: 下落tickでHPが減り、上昇tickで回復する。
-HPが市場の警告ライン以下で経営危機に入り、追証 (rescue) で回復
-しなければ破産する (運営・ユーザー問わず): 保有株は紙くず・
-会社データは消去・元オーナーは再設立可。HPが警告ライン超まで
-回復すれば危機から脱出する。
+倒産はHP制 + 追証制: 下落tickでHPが減り (1%下落→1.5HP)、上昇tickで回復する。
+HPが尽きた (0になった) ときだけ設立者に通知し、0のまま48時間が経過したら
+破産する (運営・ユーザー問わず): 保有株は紙くず・会社データは消去・
+元オーナーは再設立可。警告ライン超まで回復すれば危機から脱出するが、
+危機入り・脱出の全体通知は行わない。
 
 ユーザーは会社を設立できる (レベル連動枠、設立手数料+投資金、
 開始株価=投資金、創業者株の付与 + 売買ロイヤリティ + 値上がり配当あり)。
@@ -57,11 +57,11 @@ DIVIDEND_RATE = 0.001  # tickで値上がりしたら、上昇分×保有株数�
 # HP倒産の既定値 (市場レコードがない場合のフォールバック)。
 HP_MAX = 100
 HP_WARNING = 30
-HP_DMG_PER_PCT = 3.0
+HP_DMG_PER_PCT = 1.5
 HP_RECOVER_PER_PCT = 2.0
 RESCUE_HP_PER_100 = 10.0
-RESCUE_HOURS = 24.0
-ZERO_GRACE_HOURS = 1.0
+RESCUE_HOURS = 48.0
+ZERO_GRACE_HOURS = 48.0
 
 # パラメータ再抽選の間隔 (tick回数。tick=1分のため5tick=5分ごと)。
 RANDOMIZE_EVERY_TICKS = 5
@@ -339,11 +339,11 @@ async def ensure_market_schema() -> None:
         "jitter REAL NOT NULL DEFAULT 0, "
         "hp_max INTEGER NOT NULL DEFAULT 100, "
         "warning_hp INTEGER NOT NULL DEFAULT 30, "
-        "dmg_per_pct REAL NOT NULL DEFAULT 3.0, "
+        "dmg_per_pct REAL NOT NULL DEFAULT 1.5, "
         "recover_per_pct REAL NOT NULL DEFAULT 2.0, "
         "rescue_hp_per_100 REAL NOT NULL DEFAULT 10.0, "
-        "rescue_hours REAL NOT NULL DEFAULT 24.0, "
-        "zero_grace_hours REAL NOT NULL DEFAULT 1.0, "
+        "rescue_hours REAL NOT NULL DEFAULT 48.0, "
+        "zero_grace_hours REAL NOT NULL DEFAULT 48.0, "
         "mean_ref_price REAL NULL, mean_k REAL NULL, "
         "updated_at TEXT NOT NULL)"
     )
@@ -744,17 +744,17 @@ def dampen_impact_rate(raw_rate: float) -> float:
 async def tick_once(
     rng: random.Random | None = None,
     now: datetime | None = None,
-) -> tuple[list[Stock], list[dict], list[dict], list[dict]]:
+) -> tuple[list[Stock], list[dict], list[dict]]:
     """上場中 (is_active=1) の全銘柄を独立した乱数で1歩進める。
 
     HP制 + 追証制: 下落tickでHPが減り、上昇tickで回復する。
-    HPが警告ライン以下で経営危機に入り、追証期限 (市場別) までに
-    警告ライン超まで回復しなければ破産させる (運営・ユーザー問わず)。
-    HP0が猶予時間続いても破産。警告ライン超に回復すれば脱出する。
+    危機入り・脱出の通知は行わない。HPが初めて0になったtickで
+    crisis_since を現在時刻に付け替え (0起点の計測開始)、
+    0のまま猶予時間 (zero_grace_hours) が経過したら破産させる
+    (運営・ユーザー問わず)。警告ライン超に回復すれば脱出する。
     値上がりしたユーザー企業には創業者配当を付与する。
     戻り値は (更新後銘柄, 破産銘柄情報 [{ticker, owner_id, market_id}],
-    危機突入の警告 [{ticker, owner_id, market_id, hp, price, deadline_hours}],
-    危機脱出 [{ticker, owner_id, market_id, hp, price}])。
+    HP到達通知 [{ticker, owner_id, market_id, price, deadline_hours}])。
     """
     await ensure_market_schema()
     rng = rng or random.Random()
@@ -764,8 +764,7 @@ async def tick_once(
     stocks = await get_stocks(active_only=True)
     updated: list[Stock] = []
     bankrupted: list[dict] = []
-    warned: list[dict] = []
-    escaped: list[dict] = []
+    zeroed: list[dict] = []
     for stock in stocks:
         market = markets.get(stock.market_id) or Market(id=stock.market_id)
         try:
@@ -784,38 +783,30 @@ async def tick_once(
             continue
         new_hp = hp_after(market, stock.hp, stock.price, new_price)
         crisis_new = stock.crisis_since
-        if new_hp <= market.warning_hp and not stock.crisis_since:
-            # 経営危機に突入: 時刻を記録して警告する
+        if new_hp <= 0 and stock.hp > 0:
+            # HPが尽きた: 0起点の計測を開始して1回だけ通知する。
+            # 0継続中のtickでは通知しない (減るたびのメンション防止)。
             crisis_new = now_iso
-            warned.append(
+            zeroed.append(
                 {
                     "ticker": stock.ticker,
                     "owner_id": stock.owner_id,
                     "market_id": market.id,
-                    "hp": new_hp,
                     "price": new_price,
-                    "deadline_hours": (
-                        market.zero_grace_hours
-                        if new_hp <= 0 else market.rescue_hours
-                    ),
+                    "deadline_hours": market.zero_grace_hours,
                 }
             )
+        elif new_hp <= market.warning_hp and not stock.crisis_since:
+            # 経営危機に突入: 時刻だけ記録する (通知はしない)
+            crisis_new = now_iso
         elif stock.crisis_since:
             if new_hp > market.warning_hp:
-                # 追証などで回復: 危機から脱出
+                # 追証などで回復: 危機から脱出 (通知はしない)
                 crisis_new = None
-                escaped.append(
-                    {
-                        "ticker": stock.ticker,
-                        "owner_id": stock.owner_id,
-                        "market_id": market.id,
-                        "hp": new_hp,
-                        "price": new_price,
-                    }
-                )
             else:
-                # 危機継続: 追証期限の超過で破産。
-                # HP0は短い猶予 (zero_grace_hours) が優先される。
+                # 危機継続: 期限の超過で破産。
+                # HP0のときは zero_grace_hours が優先される
+                # (0到達tickで時刻を付け替えているため0起点の計測になる)。
                 try:
                     since = datetime.fromisoformat(stock.crisis_since)
                 except ValueError:
@@ -882,7 +873,7 @@ async def tick_once(
         (HISTORY_KEEP,),
     )
     await DBService.pool.commit()
-    return updated, bankrupted, warned, escaped
+    return updated, bankrupted, zeroed
 
 
 async def go_bankrupt(ticker: str) -> dict:
