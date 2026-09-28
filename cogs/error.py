@@ -58,6 +58,11 @@ class ErrorCog(commands.Cog):
 
         if isinstance(error, commands.CommandNotFound):
             return
+        elif isinstance(error, commands.CommandOnCooldown):
+            await ctx.reply(
+                f"速すぎるよ！あと{error.retry_after:.1f}秒待ってね。",
+                ephemeral=True,
+            )
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.reply("必要な引数が足りません。", ephemeral=True)
         elif isinstance(error, commands.MissingPermissions):
@@ -74,6 +79,11 @@ class ErrorCog(commands.Cog):
         unwrapped = _unwrap(error)
 
         if isinstance(
+            unwrapped,
+            (app_commands.CommandOnCooldown, commands.CommandOnCooldown),
+        ):
+            text = f"速すぎるよ！あと{unwrapped.retry_after:.1f}秒待ってね。"
+        elif isinstance(
             unwrapped,
             (
                 commands.MissingPermissions,

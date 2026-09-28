@@ -23,12 +23,20 @@ discord.utils.setup_logging()
 
 @bot.event
 async def setup_hook():
+    from services.cooldown import bot_check, interaction_check
+
+    bot.add_check(bot_check)
+    # インスタンス属性への代入なので self は束縛されず、引数1つの関数で正しく動く
+    bot.tree.interaction_check = interaction_check  # ty: ignore[invalid-assignment]
     await bot.load_extension("cogs.error")
     await bot.load_extension("cogs.help")
     await bot.load_extension("cogs.slot")
     await bot.load_extension("cogs.stake")
     await bot.load_extension("cogs.highlow")
     await bot.load_extension("cogs.othello")
+    await bot.load_extension("cogs.shogi")
+    await bot.load_extension("cogs.chess")
+    await bot.load_extension("cogs.ai_chat")
     await bot.load_extension("cogs.stats")
     await bot.load_extension("cogs.payment")
     await bot.load_extension("cogs.blackjack")

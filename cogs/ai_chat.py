@@ -1,0 +1,200 @@
+"""AIチャット: OpenRouter経由のロールプレイチャット。
+
+料金は市場価値(通貨指数)連動の固定式で、不足時はエラー。
+メンション・リプライで呼び出し、ユーザー毎に履歴保持・削除可。
+system指示は管理者既定 + ユーザー別persona。
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import suppress
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from objects.exceptions import AmountNotEnough
+from services import ai_chat as ai
+from services.admin import admin_only
+from services.cooldown import check_message_rate
+from services.message import buildAmountText
+
+logger = logging.getLogger(__name__)
+
+
+def _chunks(text: str, limit: int = 1900) -> list[str]:
+    return [text[i:i + limit] for i in range(0, len(text), limit)] or ["(空の応答)"]
+
+
+class AiCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        with suppress(Exception):
+            await ai.ensure_tables()
+
+    async def _run(self, user_id: int, text: str) -> str:
+        price, _ = await ai.current_price()
+        try:
+            await ai.charge(user_id, price)
+        except LookupError:
+            raise AmountNotEnough()
+        return await ai.ask(user_id, text)
+
+    async def _reply_long(self, target, text: str):
+        parts = _chunks(text)
+        first = await target.reply(parts[0])
+        for part in parts[1:]:
+            first = await first.reply(part)
+        return first
+
+    @commands.hybrid_group(name="ai", brief="AIチャットをします (有料)")
+    @commands.guild_only()
+    async def ai(self, ctx: commands.Context):
+        await ctx.reply(
+            "サブコマンドを指定してください: chat / price / clear / persona",
+            ephemeral=True,
+        )
+
+    @ai.command(name="chat", brief="AIとチャットします (有料)")
+    @app_commands.rename(text="メッセージ")
+    @app_commands.describe(text="AIへのメッセージ")
+    @commands.guild_only()
+    async def aiChatCommand(self, ctx: commands.Context, *, text: str):
+        if not text.strip():
+            await ctx.reply("メッセージを入力してください", ephemeral=True)
+            return
+        price, index = await ai.current_price()
+        try:
+            reply = await self._run(ctx.author.id, text)
+        except AmountNotEnough:
+            raise
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        await ctx.reply(
+            f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動)"
+        )
+
+    @ai.command(name="price", brief="AIチャットの現在料金を表示します")
+    @commands.guild_only()
+    async def aiPriceCommand(self, ctx: commands.Context):
+        price, index = await ai.current_price()
+        await ctx.reply(
+            f"AIチャット料金: {buildAmountText(price)} /往復\n"
+            f"(通貨価値指数 {index:.1f} 連動: 指数が低い=通貨安ほど高額)\n"
+            f"モデル: `{ai.MODEL}`",
+            ephemeral=True,
+        )
+
+    @ai.command(name="clear", brief="自分のAI履歴を削除します")
+    @commands.guild_only()
+    async def aiClearCommand(self, ctx: commands.Context):
+        n = await ai.clear_history(ctx.author.id)
+        await ctx.reply(f"履歴を削除しました ({n}件)", ephemeral=True)
+
+    @ai.command(name="persona", brief="自分専用のRP指示を設定・確認します")
+    @app_commands.rename(text="指示文")
+    @app_commands.describe(text="空にすると現在の設定を表示。clearと書くと解除")
+    @commands.guild_only()
+    async def aiPersonaCommand(self, ctx: commands.Context, *, text: str = ""):
+        text = text.strip()
+        if not text:
+            cur = await ai.get_persona(ctx.author.id)
+            if cur:
+                await ctx.reply(f"あなたのpersona:\n```\n{cur}\n```", ephemeral=True)
+            else:
+                await ctx.reply(
+                    "persona未設定 (管理者既定を使用中)。`clear`で解除、文章で設定。",
+                    ephemeral=True,
+                )
+            return
+        if text.lower() == "clear":
+            await ai.clear_persona(ctx.author.id)
+            await ctx.reply("personaを解除し、管理者既定に戻しました", ephemeral=True)
+            return
+        await ai.set_persona(ctx.author.id, text)
+        await ctx.reply("personaを設定しました", ephemeral=True)
+
+    @commands.hybrid_group(name="ai-admin", brief="※管理者専用 AI設定をします")
+    @admin_only()
+    @commands.guild_only()
+    async def aiAdmin(self, ctx: commands.Context):
+        await ctx.reply(
+            "サブコマンドを指定してください: system / model",
+            ephemeral=True,
+        )
+
+    @aiAdmin.command(name="system", brief="※管理者専用 全体既定のRP指示を設定します")
+    @app_commands.rename(text="指示文")
+    @app_commands.describe(text="空にすると現在の設定を表示")
+    @admin_only()
+    @commands.guild_only()
+    async def aiAdminSystemCommand(self, ctx: commands.Context, *, text: str = ""):
+        text = text.strip()
+        if not text:
+            cur = await ai.get_global_system()
+            await ctx.reply(
+                f"全体既定:\n```\n{cur or '(未設定: env/ビルトインを使用)'}\n```",
+                ephemeral=True,
+            )
+            return
+        await ai.set_global_system(text)
+        await ctx.reply("全体既定のRP指示を設定しました", ephemeral=True)
+
+    @aiAdmin.command(name="model", brief="※管理者専用 現在のモデル名を表示します")
+    @admin_only()
+    @commands.guild_only()
+    async def aiAdminModelCommand(self, ctx: commands.Context):
+        await ctx.reply(
+            f"モデル: `{ai.MODEL}`\n変更は `.env` の `OPENROUTER_MODEL` で行い再起動してください",
+            ephemeral=True,
+        )
+
+    @commands.Cog.listener("on_message")
+    async def onMessage(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+        bot_user = self.bot.user
+        if bot_user is None:
+            return
+        mentioned = bot_user in message.mentions
+        replied = False
+        if message.reference and message.reference.message_id:
+            try:
+                ref = await message.channel.fetch_message(message.reference.message_id)
+                replied = ref.author.id == (bot_user.id or 0)
+            except discord.DiscordException:
+                replied = False
+        if not (mentioned or replied):
+            return
+        # コマンド本文の除去
+        text = message.content
+        for m in message.mentions:
+            text = text.replace(m.mention, "")
+        text = text.replace("@everyone", "").replace("@here", "").strip()
+        if not text:
+            await message.reply("メッセージ本文を入れてメンション/リプライしてね")
+            return
+        retry = check_message_rate(message.author.id, "ai-chat")
+        if retry > 0:
+            await message.reply(f"速すぎるよ！あと{retry:.1f}秒待ってね")
+            return
+        price, _ = await ai.current_price()
+        try:
+            reply = await self._run(message.author.id, text)
+        except AmountNotEnough:
+            await message.reply(f"{buildAmountText(0)}が足りません…もとい残高が足りません (料金: {buildAmountText(price)})")
+            return
+        except ValueError as e:
+            await message.reply(str(e))
+            return
+        async with message.channel.typing():
+            pass
+        await self._reply_long(message, reply)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(AiCog(bot))

@@ -33,15 +33,21 @@ from services.database import DBService
 
 logger = logging.getLogger(__name__)
 
-TICKER_RE = re.compile(r"^[A-Z0-9]{1,10}$")
+TICKER_RE = re.compile(r"^[A-Z0-9]{1,15}$")
 HISTORY_KEEP = 200
 
 # SQLite INTEGER は符号付き64bit (最大 9223372036854775807)。
 # 幾何ランダムウォークは指数関数的に膨らむため、上限なしだと
 # Python int -> SQLite への変換で OverflowError になる。
 # tick が止まると全銘柄が更新されなくなるので価格に上限を設ける。
+# 案2: 上限を1兆→1000兆に引き上げ (9.22e18 まで1桁の余裕を残す)。
+# 売買の cost=price*qty は別途 SQLITE_MAX_INT チェックで弾く。
 SQLITE_MAX_INT = 9223372036854775807
-MAX_PRICE = 1_000_000_000_000  # 1兆。初期価格(数百〜数千)から十分に離しつつ安全域
+MAX_PRICE = 1_000_000_000_000_000  # 1000兆
+
+# 平均回帰の基準価格・強さ。高額帯ほど mu を下向きに補正し膨張を抑える。
+REFERENCE_PRICE = 1000
+MEAN_REVERSION_K = 0.002
 
 # 会社設立の手数料 (消滅)。mu ボーナス等の優遇は下の INVEST_RANKS による。
 FOUNDING_FEE = 1000
@@ -62,7 +68,7 @@ MAX_TRADE_IMPACT = 0.03
 VOL_PRESETS: dict[str, float] = {
     "calm": 0.02,  # おとなしい
     "normal": 0.05,  # ふつう
-    "wild": 0.10,  # 荒い
+    "wild": 0.06,  # 荒い (膨張抑制のため 0.10→0.06)
 }
 
 # mu のプリセット (平均成長率)
@@ -107,10 +113,10 @@ def normalize_ticker(raw: str) -> str:
     if TICKER_RE.match(cleaned):
         return cleaned
     if re.search(r"[^A-Z0-9]", cleaned):
-        m = re.search(r"[A-Z0-9]{1,10}", cleaned)
+        m = re.search(r"[A-Z0-9]{1,15}", cleaned)
         if m:
             return m.group(0)
-    raise ValueError("tickerは英数字1〜10文字で指定してください")
+    raise ValueError("tickerは英数字1〜15文字で指定してください")
 
 
 def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
@@ -118,10 +124,22 @@ def step_price(price: int, mu: float, sigma: float, rng: random.Random) -> int:
 
     丸めは確率的 (stochastic rounding) にすることで期待値を保ちつつ、
     価格1が吸着点にならないようにする (1でも毎tick数%の確率で2に脱出)。
+    高額帯では平均回帰で mu を下向き補正し、sigma を圧縮して膨張を抑える。
     """
     try:
+        eff_mu = mu
+        if price > REFERENCE_PRICE:
+            eff_mu -= MEAN_REVERSION_K * math.log(price / REFERENCE_PRICE)
+        # 高額帯のボラ圧縮: 10倍ごとに sigma を約1割抑える
+        eff_sigma = sigma
+        if price > REFERENCE_PRICE * 10:
+            eff_sigma = sigma / (
+                1.0 + 0.15 * math.log10(price / (REFERENCE_PRICE * 10))
+            )
         shock = rng.gauss(0.0, 1.0)
-        exact = price * math.exp((mu - sigma * sigma / 2) + sigma * shock)
+        exact = price * math.exp(
+            (eff_mu - eff_sigma * eff_sigma / 2) + eff_sigma * shock
+        )
     except (OverflowError, ValueError):
         # exp が発散した場合は方向だけ見て端に張り付ける
         return MAX_PRICE if mu >= 0 else 1
@@ -538,9 +556,9 @@ class InvestRank:
 # (下限, ランク)。上から順に判定する。
 INVEST_RANKS: list[tuple[int, InvestRank]] = [
     (50000, InvestRank("S", 0.003, 0.03, 0.0003)),
-    (20000, InvestRank("A", 0.002, 0.05, 0.0005)),
-    (5000, InvestRank("B", 0.001, 0.07, 0.0008)),
-    (1, InvestRank("C", 0.0, 0.09, 0.001)),
+    (20000, InvestRank("A", 0.002, 0.04, 0.0005)),
+    (5000, InvestRank("B", 0.001, 0.05, 0.0008)),
+    (1, InvestRank("C", 0.0, 0.06, 0.001)),
 ]
 
 

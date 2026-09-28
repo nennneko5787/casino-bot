@@ -23,7 +23,7 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     intro.add_field(
         name="カテゴリ",
-        value="🎰 カジノ / ⚫ オセロ / 📈 株 / 💰 お金・借金 / 🎯 ミッション / 🆙 レベル / 🛠️ 管理者",
+        value="🎰 カジノ / ⚫ オセロ / ☖ 将棋・チェス・🤖 AI / 📈 株 / 💰 お金・借金 / 🎯 ミッション / 🆙 レベル / 🛠️ 管理者",
         inline=False,
     )
     pages.append(intro)
@@ -86,6 +86,33 @@ def build_help_embeds() -> list[discord.Embed]:
         inline=False,
     )
     pages.append(othello)
+
+    board2 = discord.Embed(
+        title="☖ 将棋・♔ チェス",
+        description="駒選択→移動先選択の2段階操作。移動先選択中はキャンセル可。掛け金は開始時に徴収、勝者がペイアウトを獲得します。",
+        color=discord.Color.dark_gold(),
+    )
+    board2.add_field(
+        name="/shogi [掛け金] [強さ] [先手] / /chess [掛け金] [強さ] [先手]",
+        value="CPUと対戦。強さ: かんたん×1.5 / ふつう×1.9 / つよい×2.5",
+        inline=False,
+    )
+    board2.add_field(
+        name="/shogi-vs・/chess-vs [掛け金] [相手] [先手後手]",
+        value="指定メンバーを指名して対人戦。勝者は掛け金×2×0.95を獲得",
+        inline=False,
+    )
+    board2.add_field(
+        name="/shogi-open・/chess-open [掛け金] [先手後手]",
+        value="対戦相手を募集。参加ボタンで対戦開始",
+        inline=False,
+    )
+    board2.add_field(
+        name="/ai chat・price・clear・persona",
+        value="AIチャット (料金は通貨指数連動・/ai priceで確認)。メンション/リプライでも呼出可。履歴は/ai clearで削除",
+        inline=False,
+    )
+    pages.append(board2)
 
     stock = discord.Embed(
         title="📈 株",

@@ -382,7 +382,7 @@ class StockCog(commands.Cog):
     @stock.command(name="create", brief="会社を設立します (1人1社)")
     @app_commands.rename(ticker="銘柄", invest="投資額")
     @app_commands.describe(
-        ticker="英数字1〜10文字 (例: MYCO)",
+        ticker="英数字1〜15文字 (例: MYCO)",
         invest="会社への投資額 (1以上)。開始株価になり、額が多いほど好条件に",
     )
     @commands.guild_only()
@@ -466,7 +466,7 @@ class StockCog(commands.Cog):
         impact_preset="impactプリセット",
     )
     @app_commands.describe(
-        ticker="英数字1〜10文字 (例: SONY)",
+        ticker="英数字1〜15文字 (例: SONY)",
         price="開始価格 (1以上)",
         mu="平均成長率 -1.0〜1.0 (省略時0)",
         sigma="値動きの荒さ。数値指定か下のプリセットのどちらか",
