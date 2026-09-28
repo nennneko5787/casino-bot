@@ -1,7 +1,7 @@
 """AIチャット: OpenRouter経由のロールプレイチャット。
 
 料金は市場価値(通貨指数)連動の固定式で、不足時はエラー。
-メンション・リプライで呼び出し、ユーザー毎に履歴保持・削除可。
+メンションで呼び出し (リプライのみでは反応しない)、ユーザー毎に履歴保持・削除可。
 system指示は管理者既定 + ユーザー別persona。
 """
 
@@ -176,15 +176,8 @@ class AiCog(commands.Cog):
         bot_user = self.bot.user
         if bot_user is None:
             return
-        mentioned = bot_user in message.mentions
-        replied = False
-        if message.reference and message.reference.message_id:
-            try:
-                ref = await message.channel.fetch_message(message.reference.message_id)
-                replied = ref.author.id == (bot_user.id or 0)
-            except discord.DiscordException:
-                replied = False
-        if not (mentioned or replied):
+        # メンション必須。リプライのみ (メンションなし) では反応しない。
+        if bot_user not in message.mentions:
             return
         # コマンド本文の除去
         text = message.content
@@ -192,7 +185,7 @@ class AiCog(commands.Cog):
             text = text.replace(m.mention, "")
         text = text.replace("@everyone", "").replace("@here", "").strip()
         if not text:
-            await message.reply("メッセージ本文を入れてメンション/リプライしてね")
+            await message.reply("メッセージ本文を入れてメンションしてね")
             return
         retry = check_message_rate(message.author.id, "ai-chat")
         if retry > 0:

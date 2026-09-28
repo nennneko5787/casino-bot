@@ -109,7 +109,7 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     board2.add_field(
         name="/ai chat・price・clear・persona",
-        value="AIチャット (料金は通貨指数連動・/ai priceで確認)。メンション/リプライでも呼出可。履歴は/ai clearで削除",
+        value="AIチャット (料金は通貨指数連動・/ai priceで確認)。メンションでも呼出可。履歴は/ai clearで削除",
         inline=False,
     )
     pages.append(board2)
