@@ -34,6 +34,10 @@ class AiCog(commands.Cog):
     async def cog_load(self):
         with suppress(Exception):
             await ai.ensure_tables()
+        with suppress(Exception):
+            warning = await ai.validate_model()
+            if warning:
+                ai.logger.warning("AIモデル検証: %s", warning)
 
     async def _run(self, user_id: int, text: str) -> str:
         price, _ = await ai.current_price()
@@ -41,7 +45,12 @@ class AiCog(commands.Cog):
             await ai.charge(user_id, price)
         except LookupError:
             raise AmountNotEnough()
-        return await ai.ask(user_id, text)
+        try:
+            return await ai.ask(user_id, text)
+        except ValueError:
+            with suppress(Exception):
+                await ai.refund(user_id, price)
+            raise
 
     async def _reply_long(self, target, text: str):
         parts = _chunks(text)
@@ -72,7 +81,7 @@ class AiCog(commands.Cog):
         except AmountNotEnough:
             raise
         except ValueError as e:
-            await ctx.reply(str(e), ephemeral=True)
+            await ctx.reply(f"{e}\n-# 料金は返金されました", ephemeral=True)
             return
         await ctx.reply(
             f"{reply}\n-# 料金: {buildAmountText(price)} (通貨指数{index:.1f}連動)"
@@ -85,7 +94,7 @@ class AiCog(commands.Cog):
         await ctx.reply(
             f"AIチャット料金: {buildAmountText(price)} /往復\n"
             f"(通貨価値指数 {index:.1f} 連動: 指数が低い=通貨安ほど高額)\n"
-            f"モデル: `{ai.MODEL}`",
+            f"モデル: `{await ai.resolve_model()}`",
             ephemeral=True,
         )
 
@@ -144,12 +153,31 @@ class AiCog(commands.Cog):
         await ai.set_global_system(text)
         await ctx.reply("全体既定のRP指示を設定しました", ephemeral=True)
 
-    @aiAdmin.command(name="model", brief="※管理者専用 現在のモデル名を表示します")
+    @aiAdmin.command(name="model", brief="※管理者専用 モデルを確認・変更します")
+    @app_commands.rename(text="モデルID")
+    @app_commands.describe(text="空にすると現在の設定を表示。ID指定で即時切替")
     @admin_only()
     @commands.guild_only()
-    async def aiAdminModelCommand(self, ctx: commands.Context):
+    async def aiAdminModelCommand(self, ctx: commands.Context, *, text: str = ""):
+        text = text.strip()
+        if not text:
+            cur = await ai.resolve_model()
+            await ctx.reply(
+                f"モデル: `{cur}`\nID指定で再起動なしに切り替えられます",
+                ephemeral=True,
+            )
+            return
+        try:
+            await ai.set_model(text)
+        except ValueError as e:
+            await ctx.reply(str(e), ephemeral=True)
+            return
+        warning = None
+        with suppress(Exception):
+            warning = await ai.validate_model()
         await ctx.reply(
-            f"モデル: `{ai.MODEL}`\n変更は `.env` の `OPENROUTER_MODEL` で行い再起動してください",
+            f"モデルを `{text}` に切り替えました"
+            + (f"\n⚠️ {warning}" if warning else ""),
             ephemeral=True,
         )
 
@@ -189,7 +217,7 @@ class AiCog(commands.Cog):
             await message.reply(f"{buildAmountText(0)}が足りません…もとい残高が足りません (料金: {buildAmountText(price)})")
             return
         except ValueError as e:
-            await message.reply(str(e))
+            await message.reply(f"{e}\n-# 料金は返金されました")
             return
         async with message.channel.typing():
             pass
