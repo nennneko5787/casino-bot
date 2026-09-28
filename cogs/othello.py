@@ -699,12 +699,19 @@ class OthelloCog(commands.Cog):
         self._next_game_id = 1
         self.tiles: dict = unicode_tiles()
 
+    async def _fetch_emoji_limited(self, sem: asyncio.Semaphore, emoji_id: int):
+        async with sem:
+            return await self.bot.fetch_application_emoji(emoji_id)
+
     async def cog_load(self):
         """slot.py と同じ方式で盤面タイルのカスタム絵文字を取得する。
 
         必要な環境変数: othello_black / othello_white / othello_empty (絵文字ID)、
         othello_letters (A〜Zの絵文字IDをカンマ区切りで26個)。
         取得できなければ代替のユニコード表示にフォールバックする。
+
+        29件の一気取得は429レート制限を招くため並列数を絞り、
+        全体にもタイムアウトを付けて起動が固まらないようにする。
         """
         try:
             black_id = _env_id("othello_black")
@@ -722,11 +729,23 @@ class OthelloCog(commands.Cog):
                 or not all(part.isdigit() for part in letter_ids)
             ):
                 raise ValueError("othello用絵文字の環境変数が不足しています")
-            black = await self.bot.fetch_application_emoji(black_id)
-            white = await self.bot.fetch_application_emoji(white_id)
-            empty = await self.bot.fetch_application_emoji(empty_id)
-            letters = await asyncio.gather(
-                *(self.bot.fetch_application_emoji(int(part)) for part in letter_ids)
+            sem = asyncio.Semaphore(4)
+            black, white, empty = await asyncio.wait_for(
+                asyncio.gather(
+                    self._fetch_emoji_limited(sem, black_id),
+                    self._fetch_emoji_limited(sem, white_id),
+                    self._fetch_emoji_limited(sem, empty_id),
+                ),
+                timeout=60,
+            )
+            letters = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        self._fetch_emoji_limited(sem, int(part))
+                        for part in letter_ids
+                    )
+                ),
+                timeout=120,
             )
             if not black or not white or not empty or not all(letters):
                 raise ValueError("othello用絵文字の取得に失敗しました")
