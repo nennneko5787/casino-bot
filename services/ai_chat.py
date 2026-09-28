@@ -1,7 +1,7 @@
 """AIチャット: OpenRouter経由のロールプレイチャット。
 
-- モデルは DB設定 > env OPENROUTER_MODEL > 既定 qwen/qwen3.8-27b:free の順で解決。
-  /ai-admin model で再起動なしに切り替えられる。
+- モデルは env OPENROUTER_MODEL (既定 qwen/qwen3.8-27b:free) で固定。
+  変更は `.env` を書き換えて再起動する (コマンドからの切替は不可)。
 - 料金は固定×通貨価値指数連動: price = ceil(BASE * 100 / index)。
   通貨安(指数低)→高額、通貨高→割安。残高不足は LookupError。
   AI接続失敗時は徴収済み料金を返金する。
@@ -32,9 +32,6 @@ DEFAULT_MODEL = "qwen/qwen3.8-27b:free"
 MODEL = os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL)
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 API_URL = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
-MODELS_URL = os.environ.get(
-    "OPENROUTER_MODELS_URL", "https://openrouter.ai/api/v1/models"
-)
 BASE_PRICE = int(os.environ.get("AI_BASE_PRICE", "10"))
 HISTORY_KEEP = int(os.environ.get("AI_HISTORY_KEEP", "20"))
 TIMEOUT = float(os.environ.get("AI_TIMEOUT_SEC", "60"))
@@ -212,35 +209,9 @@ async def set_global_system(prompt: str) -> None:
     await DBService.pool.commit()
 
 
-async def get_model() -> str | None:
-    """DBに保存されたモデルID。未設定ならNone。"""
-    await ensure_tables()
-    cursor = await DBService.pool.execute(
-        "SELECT value FROM ai_global WHERE key = 'model'"
-    )
-    row = await cursor.fetchone()
-    await cursor.close()
-    return row["value"] if row else None
-
-
-async def set_model(model: str) -> None:
-    """モデルIDをDBに保存 (再起動なしで切替)。"""
-    model = model.strip()
-    if not model:
-        raise ValueError("モデルIDを入力してください")
-    await ensure_tables()
-    await DBService.pool.execute(
-        "INSERT INTO ai_global (key, value) VALUES ('model', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (model[:200],),
-    )
-    await DBService.pool.commit()
-
-
-async def resolve_model() -> str:
-    """DB設定 > env > 既定 の順でモデルIDを解決。"""
-    db = await get_model()
-    return db or MODEL
+def resolve_model() -> str:
+    """モデルIDを返す。変更は `.env` の `OPENROUTER_MODEL` で行う。"""
+    return MODEL
 
 
 async def resolve_system(user_id: int) -> str:
@@ -294,39 +265,6 @@ def _post(payload: dict) -> str:
         raise ValueError(f"AIへの接続に失敗しました ({e})") from e
 
 
-def _fetch_models() -> list[str]:
-    """利用可能モデルID一覧を取得 (起動時検証用)。"""
-    req = urllib.request.Request(
-        MODELS_URL,
-        headers={"Authorization": f"Bearer {API_KEY}"},
-    )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as res:
-        data = json.loads(res.read().decode("utf-8"))
-    models = data.get("data", []) if isinstance(data, dict) else []
-    return [m.get("id", "") for m in models if isinstance(m, dict) and m.get("id")]
-
-
-async def validate_model() -> str | None:
-    """設定モデルがOpenRouterに存在するか確認。問題なければNone、あれば警告文。
-
-    APIキー未設定・一覧取得失敗時は検証をスキップしてNoneを返す。
-    """
-    if not API_KEY:
-        return None
-    model = await resolve_model()
-    try:
-        ids = await asyncio.to_thread(_fetch_models)
-    except Exception as e:  # noqa: BLE001 - 検証失敗時は警告のみで継続
-        logger.warning("モデル一覧の取得に失敗: %s", e)
-        return None
-    if model not in ids:
-        return (
-            f"設定モデル `{model}` がOpenRouterの一覧にありません。"
-            "`/ai-admin model` でIDを確認してください"
-        )
-    return None
-
-
 async def refund(user_id: int, price: int) -> None:
     """徴収済み料金を返金する (AI失敗時用)。"""
     if price < 1:
@@ -352,7 +290,7 @@ async def ask(user_id: int, text: str) -> str:
     messages = [{"role": "system", "content": system}]
     messages += history
     messages.append({"role": "user", "content": text})
-    payload = {"model": await resolve_model(), "messages": messages}
+    payload = {"model": resolve_model(), "messages": messages}
     try:
         raw = await asyncio.to_thread(_post, payload)
     except ValueError:

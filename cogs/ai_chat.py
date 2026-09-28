@@ -34,10 +34,6 @@ class AiCog(commands.Cog):
     async def cog_load(self):
         with suppress(Exception):
             await ai.ensure_tables()
-        with suppress(Exception):
-            warning = await ai.validate_model()
-            if warning:
-                ai.logger.warning("AIモデル検証: %s", warning)
 
     async def _run(self, user_id: int, text: str) -> str:
         price, _ = await ai.current_price()
@@ -94,7 +90,7 @@ class AiCog(commands.Cog):
         await ctx.reply(
             f"AIチャット料金: {buildAmountText(price)} /往復\n"
             f"(通貨価値指数 {index:.1f} 連動: 指数が低い=通貨安ほど高額)\n"
-            f"モデル: `{await ai.resolve_model()}`",
+            f"モデル: `{ai.resolve_model()}`",
             ephemeral=True,
         )
 
@@ -132,7 +128,7 @@ class AiCog(commands.Cog):
     @commands.guild_only()
     async def aiAdmin(self, ctx: commands.Context):
         await ctx.reply(
-            "サブコマンドを指定してください: system / model",
+            "サブコマンドを指定してください: system",
             ephemeral=True,
         )
 
@@ -152,34 +148,6 @@ class AiCog(commands.Cog):
             return
         await ai.set_global_system(text)
         await ctx.reply("全体既定のRP指示を設定しました", ephemeral=True)
-
-    @aiAdmin.command(name="model", brief="※管理者専用 モデルを確認・変更します")
-    @app_commands.rename(text="モデルID")
-    @app_commands.describe(text="空にすると現在の設定を表示。ID指定で即時切替")
-    @admin_only()
-    @commands.guild_only()
-    async def aiAdminModelCommand(self, ctx: commands.Context, *, text: str = ""):
-        text = text.strip()
-        if not text:
-            cur = await ai.resolve_model()
-            await ctx.reply(
-                f"モデル: `{cur}`\nID指定で再起動なしに切り替えられます",
-                ephemeral=True,
-            )
-            return
-        try:
-            await ai.set_model(text)
-        except ValueError as e:
-            await ctx.reply(str(e), ephemeral=True)
-            return
-        warning = None
-        with suppress(Exception):
-            warning = await ai.validate_model()
-        await ctx.reply(
-            f"モデルを `{text}` に切り替えました"
-            + (f"\n⚠️ {warning}" if warning else ""),
-            ephemeral=True,
-        )
 
     @commands.Cog.listener("on_message")
     async def onMessage(self, message: discord.Message):
