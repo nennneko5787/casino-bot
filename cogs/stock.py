@@ -1,22 +1,17 @@
 """株価: 売買 + 会社設立 + 折れ線チャート + 株式市場。
 
-一般: /stock buy|sell|create|invest|rescue|retire|reopen|chart|currency|portfolio|list
+一般: /stock buy|sell|create|invest|retire|reopen|chart|currency|portfolio|list
 管理者: /stock-admin add|move|delist|relist|set-price
 管理者: /stock-market create|update|delete|list
 
-銘柄は株式市場に所属し、市場ごとに値動きレンジ (mu/sigma/impact) と
-HP倒産ルールが違う。mu/sigma/impactは5分ごとに市場レンジ内で自動再抽選
+銘柄は株式市場に所属し、市場ごとに値動きレンジ (mu/sigma/impact) が違う。
+mu/sigma/impactは5分ごとに市場レンジ内で自動再抽選
 され、個別指定はできない (params廃止)。
-倒産はHP制 + 追証制: 猶予を超える下落でHPが減り (猶予・倍率は市場と
-ランクで変動)、HPが尽きたとき1エピソード1回だけ通知する。
-0のまま48時間以内に追証 (rescue・誰でも可) で回復しなければ破産
-(保有株は紙くず・会社消去)。危機入り・脱出の全体通知は行わない。
-平常時も札束でHP回復 (追証) できる。
+会社の金庫口座・所得税は /company で扱う。
 """
 
 import asyncio
 import logging
-import os
 import time
 from contextlib import suppress
 
@@ -81,14 +76,6 @@ async def market_autocomplete(
     ][:25]
 
 
-def _hp_bar(hp: int, hp_max: int, width: int = 10) -> str:
-    """HPバー (例: ██████░░░░ 62/100)。"""
-    if hp_max < 1:
-        return ""
-    filled = max(0, min(width, round(hp / hp_max * width)))
-    return f"{'█' * filled}{'░' * (width - filled)} {hp}/{hp_max}"
-
-
 async def build_stock_list_embed(
     market_id: str, page: int
 ) -> tuple[discord.Embed, int, str]:
@@ -117,11 +104,8 @@ async def build_stock_list_embed(
             mark = ""
         status = "" if s.is_active else " [取扱停止]"
         owner = f" [U:<@{s.owner_id}>]" if s.owner_id is not None else ""
-        crisis, _ = stocks.crisis_info(s, market)
-        crisis_mark = " ⚠️経営危機" if crisis else ""
         lines.append(
-            f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{owner}\n"
-            f"{_hp_bar(s.hp, market.hp_max)}{crisis_mark}"
+            f"`{s.ticker}`: {buildAmountText(s.price)} {mark}{status}{owner}"
         )
     desc = "\n".join(lines) if lines else "銘柄がありません"
     embed = discord.Embed(
@@ -229,28 +213,6 @@ class StockCog(commands.Cog):
         logger.info("株価の起動時再チェックを実行します")
         await self._run_tick()
 
-    async def _log_channel(
-        self, guild: discord.Guild | None
-    ) -> discord.abc.Messageable | None:
-        """経営危機・破産関連通知先。envのlog_channel優先、なければ従来の通知先。"""
-        if guild is not None:
-            raw = os.environ.get("log_channel", "").strip()
-            if raw.isdigit():
-                ch = guild.get_channel(int(raw))
-                if ch is None:
-                    with suppress(discord.DiscordException):
-                        ch = await guild.fetch_channel(int(raw))
-                if isinstance(ch, discord.abc.Messageable):
-                    return ch
-        return self._notify_channel(guild)
-
-    async def _broadcast(self, msg: str):
-        for guild in self.bot.guilds:
-            with suppress(Exception):
-                ch = await self._log_channel(guild)
-                if ch is not None:
-                    await ch.send(msg)
-
     async def _run_tick(self):
         # 起動時再チェックとtick_loop初回が重なった場合は片方だけ進める
         now = time.monotonic()
@@ -259,7 +221,7 @@ class StockCog(commands.Cog):
         self._last_tick_at = now
         self._tick_count += 1
         try:
-            _, bankrupted, zeroed = await stocks.tick_once()
+            await stocks.tick_once()
             # 5分ごとに mu/sigma/impact を市場レンジ内で再抽選する
             if self._tick_count % stocks.RANDOMIZE_EVERY_TICKS == 0:
                 with suppress(Exception):
@@ -267,22 +229,6 @@ class StockCog(commands.Cog):
         except Exception:
             logger.exception("株価の定期更新に失敗")
             return
-        for info in zeroed:
-            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
-            await self._broadcast(
-                f"🪫 `{info['ticker']}` のHPが尽きました"
-                f"（市場{info['market_id']}）\n"
-                f"設立者: {owner}／{info['deadline_hours']:g}時間以内に"
-                "誰でも `/stock rescue` で追証できます"
-                "（回復するまで再通知しません）"
-            )
-        for info in bankrupted:
-            owner = f"<@{info['owner_id']}>" if info["owner_id"] else "運営"
-            await self._broadcast(
-                f"💸 `{info['ticker']}` が破産しました"
-                f"（市場{info['market_id']}・HP枯渇）\n"
-                f"設立者: {owner}／保有株は紙くずになりました"
-            )
 
     @tasks.loop(minutes=TICK_INTERVAL_MINUTES)
     async def tick_loop(self):
@@ -292,19 +238,6 @@ class StockCog(commands.Cog):
     async def _before_tick(self):
         await self.bot.wait_until_ready()
 
-    def _notify_channel(
-        self, guild: discord.Guild | None
-    ) -> discord.TextChannel | None:
-        if guild is None:
-            return None
-        ch = guild.system_channel
-        if ch is not None and ch.permissions_for(guild.me).send_messages:
-            return ch
-        for c in guild.text_channels:
-            if c.permissions_for(guild.me).send_messages:
-                return c
-        return None
-
     # ---------- /stock グループ ----------
 
     @commands.hybrid_group(name="stock", brief="株取引・会社設立をします")
@@ -312,7 +245,7 @@ class StockCog(commands.Cog):
     async def stock(self, ctx: commands.Context):
         await ctx.reply(
             "サブコマンドを指定してください: "
-            "buy / sell / create / invest / rescue / retire / reopen / chart / "
+            "buy / sell / create / invest / retire / reopen / chart / "
             "currency / portfolio / list",
             ephemeral=True,
         )
@@ -513,21 +446,7 @@ class StockCog(commands.Cog):
         file = discord.File(buf, filename=CHART_NAME)
         market = await stocks.get_market(stock.market_id)
         market_name = market.display_name if market else stock.market_id
-        hp_max = market.hp_max if market else stocks.HP_MAX
-        if market:
-            in_crisis, elapsed = stocks.crisis_info(stock, market)
-            if in_crisis:
-                rest = stocks.rescue_deadline_hours(stock, market)
-                hp_note = (
-                    f"\n⚠️経営危機: HP {_hp_bar(stock.hp, hp_max)}"
-                    f" ({elapsed:.1f}h経過・残り約{rest:.1f}h)"
-                    "\n追証は `/stock rescue` で"
-                )
-            else:
-                hp_note = f"\nHP: {_hp_bar(stock.hp, hp_max)}"
-        else:
-            hp_note = ""
-        market_note = f"\n市場: {market_name}{hp_note}"
+        market_note = f"\n市場: {market_name}"
         embed = discord.Embed(
             title=f"{name} チャート📈",
             description=(
@@ -535,11 +454,6 @@ class StockCog(commands.Cog):
                 f"mu={stock.mu} sigma={stock.sigma} impact={stock.impact:.4f}/株"
                 + ("" if stock.is_active else "\n※取扱停止中")
                 + market_note
-                + (
-                    f"\n下落猶予{market.drop_threshold_pct:g}%"
-                    + (f"(ランク{stock.rank}の打たれ強さ適用)" if stock.rank else "")
-                    if market else ""
-                )
             ),
             color=discord.Color.blue(),
         )
@@ -579,7 +493,6 @@ class StockCog(commands.Cog):
             return
         markets = await stocks.get_markets()
         market_names = {m.id: m.display_name for m in markets}
-        market_hp_max = {m.id: m.hp_max for m in markets}
         all_stocks = {s.ticker: s for s in await stocks.get_stocks(active_only=False)}
         lines = []
         total_profit = 0
@@ -589,10 +502,8 @@ class StockCog(commands.Cog):
             st = all_stocks.get(item["ticker"])
             if st is not None:
                 market_tag = f"[{market_names.get(st.market_id, st.market_id)}]"
-                hp_max = market_hp_max.get(st.market_id, stocks.HP_MAX)
-                hp_text = f" HP{_hp_bar(st.hp, hp_max)}"
             else:
-                market_tag, hp_text = "", ""
+                market_tag = ""
             if item["profit"] > 0:
                 profit_text = f"損益+{buildAmountText(item['profit'])}"
             elif item["profit"] < 0:
@@ -606,7 +517,7 @@ class StockCog(commands.Cog):
                 f"`{item['ticker']}`{market_tag}{status}: {item['qty']}株 "
                 f"(平均{buildAmountText(item['avg_cost'])} → "
                 f"現在{buildAmountText(item['price'])}) "
-                f"評価{buildAmountText(item['market'])} {profit_text}{hp_text}"
+                f"評価{buildAmountText(item['market'])} {profit_text}"
             )
         await ctx.reply(
             embed=discord.Embed(
@@ -713,49 +624,6 @@ class StockCog(commands.Cog):
             "※株価は変わりません (時価増資のため)"
         )
 
-    @stock.command(name="rescue", brief="会社に追証します (HP回復・誰でも可)")
-    @app_commands.rename(ticker="銘柄", amount="追証額")
-    @app_commands.describe(
-        ticker="追証する会社の銘柄 (運営・他人・自分の会社すべて可)",
-        amount="投じる金額 (1以上)。HPが回復します",
-    )
-    @app_commands.autocomplete(ticker=ticker_autocomplete)
-    @commands.guild_only()
-    async def stockRescueCommand(
-        self, ctx: commands.Context, ticker: str, amount: int
-    ):
-        try:
-            gain, new_hp, escaped = await stocks.rescue(
-                ctx.author.id, ticker, amount
-            )
-        except ValueError as e:
-            await ctx.reply(str(e), ephemeral=True)
-            return
-        except LookupError:
-            raise AmountNotEnough()
-        if escaped:
-            note = "✅ 経営危機から脱出しました！"
-        else:
-            stock = await stocks.get_stock(ticker.strip().upper())
-            if stock is not None:
-                market = await stocks.get_market(stock.market_id)
-                in_crisis = (
-                    stocks.crisis_info(stock, market)[0]
-                    if market else False
-                )
-                if in_crisis and market is not None:
-                    rest = stocks.rescue_deadline_hours(stock, market)
-                    note = f"引き続き経営危機です (期限まで残り約{rest:.1f}h)"
-                else:
-                    note = "💪 HPが回復しました！"
-            else:
-                note = ""
-        await ctx.reply(
-            f"🛟 `{ticker.strip().upper()}` に追証しました！\n"
-            f"投じた金額: {buildAmountText(amount)}\n"
-            f"HP +{gain} → {new_hp}\n{note}"
-        )
-
     @stock.command(name="retire", brief="自分の会社を取扱停止します")
     @app_commands.rename(ticker="銘柄")
     @app_commands.autocomplete(ticker=ticker_autocomplete)
@@ -820,7 +688,7 @@ class StockCog(commands.Cog):
             return
         await ctx.reply(
             f"`{stock.ticker}` を上場しました: "
-            f"{buildAmountText(stock.price)} (市場{stock.market_id}・HP{stock.hp})"
+            f"{buildAmountText(stock.price)} (市場{stock.market_id})"
         )
 
     @stockAdmin.command(name="delist", brief="※管理者専用 銘柄を取扱停止します")
@@ -882,8 +750,7 @@ class StockCog(commands.Cog):
             await ctx.reply(str(e), ephemeral=True)
             return
         await ctx.reply(
-            f"`{stock.ticker}` を市場{stock.market_id}に移動しました "
-            f"(HP{stock.hp})"
+            f"`{stock.ticker}` を市場{stock.market_id}に移動しました"
         )
 
 
@@ -914,10 +781,7 @@ class StockCog(commands.Cog):
             f"銘柄数{counts.get(m.id, 0)}・"
             f"mu[{m.mu_min:g}〜{m.mu_max:g}] "
             f"σ[{m.sigma_min:g}〜{m.sigma_max:g}] "
-            f"impact[{m.impact_min:g}〜{m.impact_max:g}]\n"
-            f"HP上限{m.hp_max}・警告{m.warning_hp}・"
-            f"下落猶予{m.drop_threshold_pct:g}%・"
-            f"追証期限{m.rescue_hours:g}h・HP0猶予{m.zero_grace_hours:g}h"
+            f"impact[{m.impact_min:g}〜{m.impact_max:g}]"
             + (
                 f"・平均回帰(基準{m.mean_ref_price:g}, k={m.mean_k:g})"
                 if m.mean_ref_price is not None and m.mean_k is not None
@@ -947,8 +811,6 @@ class StockCog(commands.Cog):
         sigma_max="sigma上限 (既定0.05)",
         impact_min="impact下限 (既定0.0002)",
         impact_max="impact上限 (既定0.0006)",
-        warning_hp="経営危機に入るHP (既定30)",
-        rescue_hours="追証期限h (既定48)",
     )
     async def stockMarketCreateCommand(
         self,
@@ -962,8 +824,6 @@ class StockCog(commands.Cog):
         sigma_max: float = 0.05,
         impact_min: float = 0.0002,
         impact_max: float = 0.0006,
-        warning_hp: int = 30,
-        rescue_hours: float = 48.0,
     ):
         try:
             market = await stocks.create_market(
@@ -974,7 +834,6 @@ class StockCog(commands.Cog):
                     mu_min=mu_min, mu_max=mu_max,
                     sigma_min=sigma_min, sigma_max=sigma_max,
                     impact_min=impact_min, impact_max=impact_max,
-                    warning_hp=warning_hp, rescue_hours=rescue_hours,
                 )
             )
         except ValueError as e:
@@ -996,13 +855,6 @@ class StockCog(commands.Cog):
         sigma_min="sigma下限", sigma_max="sigma上限",
         impact_min="impact下限", impact_max="impact上限",
         jitter="銘柄ゆらぎ幅",
-        hp_max="HP上限", warning_hp="危機ラインHP",
-        dmg_per_pct="下落1%あたりのHP減",
-        recover_per_pct="上昇1%あたりのHP回復",
-        drop_threshold_pct="この下落率%まではHP無傷",
-        rescue_hp_per_100="100通貨あたりの回復HP",
-        rescue_hours="追証期限h",
-        zero_grace_hours="HP0の猶予h",
     )
     @app_commands.autocomplete(market_id=market_autocomplete)
     async def stockMarketUpdateCommand(
@@ -1018,26 +870,13 @@ class StockCog(commands.Cog):
         impact_min: float | None = None,
         impact_max: float | None = None,
         jitter: float | None = None,
-        hp_max: int | None = None,
-        warning_hp: int | None = None,
-        dmg_per_pct: float | None = None,
-        recover_per_pct: float | None = None,
-        drop_threshold_pct: float | None = None,
-        rescue_hp_per_100: float | None = None,
-        rescue_hours: float | None = None,
-        zero_grace_hours: float | None = None,
     ):
         fields: dict[str, float | int | str] = {
             k: v for k, v in {
                 "mu_min": mu_min, "mu_max": mu_max,
                 "sigma_min": sigma_min, "sigma_max": sigma_max,
                 "impact_min": impact_min, "impact_max": impact_max,
-                "jitter": jitter, "hp_max": hp_max, "warning_hp": warning_hp,
-                "dmg_per_pct": dmg_per_pct, "recover_per_pct": recover_per_pct,
-                "drop_threshold_pct": drop_threshold_pct,
-                "rescue_hp_per_100": rescue_hp_per_100,
-                "rescue_hours": rescue_hours,
-                "zero_grace_hours": zero_grace_hours,
+                "jitter": jitter,
             }.items() if v is not None
         }
         if name is not None:
