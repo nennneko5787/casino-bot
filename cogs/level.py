@@ -59,11 +59,13 @@ async def _send_levelup(
     reward: int,
     repaid: int = 0,
 ) -> None:
-    """レベルアップ通知を画像で送る。失敗時はEmbedにフォールバック。"""
+    """レベルアップ通知を画像で送る。失敗時はEmbedにフォールバック。
+
+    メンションは飛ばさず、表示名のテキストのみで通知する。
+    """
     if sendable is None:
         logger.warning("レベルアップ通知先チャンネルが取得できませんでした")
         return
-    mention = getattr(member, "mention", None) or str(member)
     name = getattr(member, "display_name", str(member))
     try:
         av = await _avatar_bytes(member)
@@ -71,14 +73,16 @@ async def _send_levelup(
             render_levelup_card, name, old, new, gained, reward, av, repaid
         )
         await sendable.send(
-            content=f"{mention} レベルアップ！",
+            content=f"{name} レベルアップ！",
             file=discord.File(buf, filename="levelup.png"),
+            allowed_mentions=discord.AllowedMentions.none(),
         )
     except Exception:
         logger.exception("レベルアップ画像の送信に失敗")
         with suppress(Exception):
             await sendable.send(
-                embed=build_levelup_embed(mention, old, new, gained, reward, repaid)
+                embed=build_levelup_embed(name, old, new, gained, reward, repaid),
+                allowed_mentions=discord.AllowedMentions.none(),
             )
 
 
@@ -118,14 +122,14 @@ def build_level_embed(
 
 
 def build_levelup_embed(
-    mention: str, old: int, new: int, gained: int, reward: int, repaid: int
+    display_name: str, old: int, new: int, gained: int, reward: int, repaid: int
 ) -> discord.Embed:
     up = new - old
     need_next = levels.xp_for_next(new)
     embed = discord.Embed(
         title="🎉 レベルアップ！",
         description=(
-            f"{mention} が **Lv.{old} → Lv.{new}** に上がった！ (+{up}Lv)\n"
+            f"{display_name} が **Lv.{old} → Lv.{new}** に上がった！ (+{up}Lv)\n"
             f"今回の獲得XP: `+{gained}XP`\n"
             f"次のレベルまで: `{need_next}XP`"
         ),
