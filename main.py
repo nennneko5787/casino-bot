@@ -1,5 +1,8 @@
 import asyncio
+import faulthandler
+import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from http.client import HTTPException
 
@@ -14,11 +17,44 @@ from services.money import getUser, saveUser
 
 dotenv.load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+# 起動時に順番に読み込むcog。setup_hook は login() 内で呼ばれるため、
+# ここで止まると on_ready まで来ない (= コマンドが一切反応しなくなる)。
+EXTENSIONS = (
+    "cogs.error",
+    "cogs.help",
+    "cogs.slot",
+    "cogs.stake",
+    "cogs.highlow",
+    "cogs.othello",
+    "cogs.shogi",
+    "cogs.chess",
+    "cogs.ai_chat",
+    "cogs.stats",
+    "cogs.payment",
+    "cogs.blackjack",
+    "cogs.stock",
+    "cogs.company",
+    "cogs.ranking",
+    "cogs.loan",
+    "cogs.mission",
+    "cogs.level",
+    "cogs.sync",
+)
+
+# othello の絵文字取得 (wait_for 60+120秒) を許容する上限。
+# 超過したcog は TimeoutError で起動を中断し、固まったまま放置しない。
+EXT_LOAD_TIMEOUT = 300.0
 
 intents = discord.Intents.all()
 bot = commands.Bot("c#", intents=intents, help_command=None)
 
 discord.utils.setup_logging()
+
+# 起動中の無応答を調査するため `kill -USR1 <pid>` で全スレッドのスタックをdump できるようにする
+if hasattr(signal, "SIGUSR1"):
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 @bot.event
@@ -28,25 +64,11 @@ async def setup_hook():
     bot.add_check(bot_check)
     # インスタンス属性への代入なので self は束縛されず、引数1つの関数で正しく動く
     bot.tree.interaction_check = interaction_check  # ty: ignore[invalid-assignment]
-    await bot.load_extension("cogs.error")
-    await bot.load_extension("cogs.help")
-    await bot.load_extension("cogs.slot")
-    await bot.load_extension("cogs.stake")
-    await bot.load_extension("cogs.highlow")
-    await bot.load_extension("cogs.othello")
-    await bot.load_extension("cogs.shogi")
-    await bot.load_extension("cogs.chess")
-    await bot.load_extension("cogs.ai_chat")
-    await bot.load_extension("cogs.stats")
-    await bot.load_extension("cogs.payment")
-    await bot.load_extension("cogs.blackjack")
-    await bot.load_extension("cogs.stock")
-    await bot.load_extension("cogs.company")
-    await bot.load_extension("cogs.ranking")
-    await bot.load_extension("cogs.loan")
-    await bot.load_extension("cogs.mission")
-    await bot.load_extension("cogs.level")
-    await bot.load_extension("cogs.sync")
+    for ext in EXTENSIONS:
+        # 止まった cog を特定できるよう、読み込み直前に必ず1行ログを出す
+        logger.info("cogs: %s を読み込み中", ext)
+        await asyncio.wait_for(bot.load_extension(ext), timeout=EXT_LOAD_TIMEOUT)
+    logger.info("cogs: すべてのcogの読み込みが完了しました")
 
 
 @asynccontextmanager
