@@ -315,7 +315,7 @@ class CompanyCog(commands.Cog):
         )
 
     @company.command(name="decide", brief="※設立者用 引出申請を承認/拒否します")
-    @app_commands.rename(request_id="申請ID", approve="承認するなら真")
+    @app_commands.rename(request_id="申請id", approve="承認するなら真")
     @app_commands.describe(request_id="申請メッセージの申請ID", approve="承認はTrue、拒否はFalse")
     @commands.guild_only()
     async def companyDecideCommand(
