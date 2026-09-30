@@ -67,14 +67,31 @@ async def setup_hook():
     for ext in EXTENSIONS:
         # 止まった cog を特定できるよう、読み込み直前に必ず1行ログを出す
         logger.info("cogs: %s を読み込み中", ext)
-        await asyncio.wait_for(bot.load_extension(ext), timeout=EXT_LOAD_TIMEOUT)
+        try:
+            await asyncio.wait_for(bot.load_extension(ext), timeout=EXT_LOAD_TIMEOUT)
+        except Exception:
+            logger.exception("cogs: %s の読み込みに失敗しました", ext)
+            raise
     logger.info("cogs: すべてのcogの読み込みが完了しました")
+
+
+async def _run_bot() -> None:
+    """bot.start はバックグラウンドタスクで起動するため、
+    失敗しても例外が.tasks に溜まるだけでログに出ない。
+    ここで確実にログに残し、原因不明の無応答を防ぐ。
+    """
+    try:
+        await bot.start(os.getenv("discord") or "")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("discord bot の起動に失敗しました (process は生きています)")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await DBService.connect()
-    task = asyncio.create_task(bot.start(os.getenv("discord") or ""))
+    task = asyncio.create_task(_run_bot())
     yield
     task.cancel()
     await DBService.pool.close()
