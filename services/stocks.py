@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from services.database import DBService
+from services.money import MAX_BALANCE
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ FOUNDING_FEE = 1000
 ROYALTY_RATE = 0.01  # 他人が自社株を売買するたび、代金のこの割合が設立者に入る
 FOUNDER_SHARES_PER = 1000  # この投資額ごとに創業者株1株 (最低1株、売却のみ可)
 DIVIDEND_RATE = 0.001  # tickで値上がりしたら、上昇分×保有株数×この割合を配当
+# 1tick に発行できる配当の上限 (その銘柄の時価総額に対する割合)。
+# (1+この値)^1440tick で1日の理論倍率がほぼ1に収まり、供給の複利型の膨張を防ぐ。
+DIVIDEND_CAP_RATE = 1e-7
 
 # パラメータ再抽選の間隔 (tick回数。tick=1分のため5tick=5分ごと)。
 RANDOMIZE_EVERY_TICKS = 5
@@ -701,8 +705,9 @@ async def tick_once(
     )
     avg_row = await cursor.fetchone()
     await cursor.close()
+    # SUM は合計が int64 を超えると integer overflow で落ちるため TOTAL (REAL) を使う。
     cursor = await DBService.pool.execute(
-        "SELECT COALESCE(SUM(amount), 0) AS s FROM users"
+        "SELECT COALESCE(TOTAL(amount), 0) AS s FROM users"
     )
     sup_row = await cursor.fetchone()
     await cursor.close()
@@ -712,7 +717,7 @@ async def tick_once(
         (
             now_iso,
             avg_row["a"] if avg_row and avg_row["a"] else 0,
-            min(sup_row["s"], SQLITE_MAX_INT) if sup_row and sup_row["s"] else 0,
+            min(int(sup_row["s"]), SQLITE_MAX_INT) if sup_row and sup_row["s"] else 0,
         ),
     )
     await DBService.pool.execute(
@@ -880,23 +885,25 @@ def next_slot_level(level: int) -> int | None:
     return slots * COMPANY_SLOT_STEP
 
 
-async def _credit_royalty(owner_id: int | None, base: int) -> int:
-    """売買ロイヤリティ (代金×ROYALTY_RATE) を設立者に付与。戻り値は付与額。
+def _royalty_of(base: int) -> int:
+    """売買代金から徴収するロイヤリティ額。代金を超えない範囲に収める。"""
+    return min(int(base * ROYALTY_RATE), base)
 
-    運営負担の鋳造方式 (売主・買主の金額は変わらない)。端数切捨てで
-    1未満はスキップする。自分の売買は対象外 (呼び出し側で除外する)。
+
+async def _pay_royalty(owner_id: int | None, royalty: int) -> int:
+    """設立者へロイヤリティを支払う。戻り値は支払額。
+
+    呼び出し側で取引者の代金/受取から同額を差し引いてあるため、
+    通貨総量は増えず、売買だけでは経済が膨らまない。
     """
-    if owner_id is None:
-        return 0
-    royalty = min(int(base * ROYALTY_RATE), SQLITE_MAX_INT)
-    if royalty < 1:
+    if owner_id is None or royalty < 1:
         return 0
     await _add_user_amount(owner_id, royalty)
     return royalty
 
 
 async def _add_user_amount(user_id: int, amount: int) -> None:
-    """ユーザー残高を加算 (上限 SQLITE_MAX_INT で丸める)。行がなければ作る。"""
+    """ユーザー残高を加算 (上限 MAX_BALANCE で丸める)。行がなければ作る。"""
     if amount < 1:
         return
     await DBService.pool.execute(
@@ -910,7 +917,7 @@ async def _add_user_amount(user_id: int, amount: int) -> None:
     balance = row["amount"] if row else 100
     await DBService.pool.execute(
         "UPDATE users SET amount = ? WHERE id = ?",
-        (min(balance + amount, SQLITE_MAX_INT), user_id),
+        (min(balance + amount, MAX_BALANCE), user_id),
     )
     await DBService.pool.commit()
 
@@ -932,7 +939,13 @@ async def _grant_founder_dividend(stock: Stock, gain: int) -> int:
     if not row or row["qty"] < 1:
         return 0
     rate = dividend_for_rank(stock.rank)
-    dividend = min(int(gain * row["qty"] * rate), SQLITE_MAX_INT)
+    # 上限は時価総額に対する比率で決める。値上がり幅×株数×配当率だけを
+    # 使うと価格暴騰時に供給が複利で増え続けるため、資金に裏打ちされた
+    # 金額 (時価総額) を基準にする。
+    dividend = min(
+        int(gain * row["qty"] * rate),
+        int(row["qty"] * stock.price * DIVIDEND_CAP_RATE),
+    )
     if dividend < 1:
         return 0
     await _add_user_amount(stock.owner_id, dividend)
@@ -1095,13 +1108,15 @@ async def add_investment(
 
 
 async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float, int]:
-    """購入。戻り値は (約定単価, 合計金額, 需給変動率, ロイヤリティ額)。
+    """購入。戻り値は (約定単価, 実支払金額, 需給変動率, ロイヤリティ額)。
 
     残高の増減も直接SQLで行うため Discord オブジェクトは不要。
     残高不足時は LookupError (Cog側で AmountNotEnough に変換する)。
     約定単価は需給影響反映後の価格 (買い上がった後の値段で買う。
     買ってすぐ売っても押し上げ分で得しないスリッページ方式)。
-    他人の会社を買った場合、代金の ROYALTY_RATE が設立者に還元される。
+    他人の会社を買った場合、代金の ROYALTY_RATE が設立者に払い渡される。
+    実支払 = 代金 + ロイヤリティで、設立者へ渡った分が通貨総量に戻るので
+    売買だけでは通貨が増えない。
     """
     ticker = normalize_ticker(ticker)
     if qty < 1:
@@ -1136,13 +1151,16 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float, int
     cost = exec_price * qty
     if cost > SQLITE_MAX_INT:
         raise ValueError("数量が多すぎます (合計金額が上限を超えます)")
-    if balance < cost:
+    # ロイヤリティは買主の支払から設立者へ払い渡す (通貨総量は増やさない)
+    royalty = _royalty_of(cost) if stock.owner_id is not None else 0
+    paid = cost + royalty
+    if balance < paid:
         # 金額表示は呼び出し側で AmountNotEnough に変換させる
-        raise LookupError(f"残高不足: 必要 {cost}")
+        raise LookupError(f"残高不足: 必要 {paid}")
 
     # 残高更新は money 層の User dataclass を介さず直接SQL (Bot未起動の検証でも動く)
     await DBService.pool.execute(
-        "UPDATE users SET amount = amount - ? WHERE id = ?", (cost, user_id)
+        "UPDATE users SET amount = amount - ? WHERE id = ?", (paid, user_id)
     )
     cursor = await DBService.pool.execute(
         "SELECT * FROM holdings WHERE user_id = ? AND ticker = ?",
@@ -1173,8 +1191,8 @@ async def buy(user_id: int, ticker: str, qty: int) -> tuple[int, int, float, int
         (ticker, exec_price, now),
     )
     await DBService.pool.commit()
-    royalty = await _credit_royalty(stock.owner_id, cost)
-    return exec_price, cost, rate, royalty
+    await _pay_royalty(stock.owner_id, royalty)
+    return exec_price, paid, rate, royalty
 
 
 async def sell(
@@ -1184,8 +1202,8 @@ async def sell(
 
     上場廃止銘柄も売却は可能。自社株は売却のみ可 (買増は不可)。
     受取金額は借金返済優先で配分される。
-    他人の会社の株を売った場合、代金の ROYALTY_RATE が設立者に還元される
-    (自分の売買は対象外)。
+    他人の会社の株を売った場合、代金の ROYALTY_RATE が設立者に払い渡される
+    (自分の売買は対象外)。受取金額から差し引かれるため通貨総量は増えない。
     約定単価は需給影響反映後の価格 (売り崩した後の値段で売る。
     売ってすぐ買い戻しても値下がり分で得しないスリッページ方式)。
     受取が64bit上限を超える数量はエラーにし、売れる最大株数を提示する
@@ -1222,6 +1240,11 @@ async def sell(
         raise ValueError(
             f"数量が多すぎます (受取が上限を超えます。{max_qty}株までなら可能です)"
         )
+    # ロイヤリティは売主の受取から設立者へ払い渡す (通貨総量は増やさない)
+    royalty = 0
+    if stock.owner_id is not None and stock.owner_id != user_id:
+        royalty = _royalty_of(proceeds)
+    received = proceeds - royalty
     new_qty = holding["qty"] - qty
     if new_qty == 0:
         await DBService.pool.execute(
@@ -1234,7 +1257,7 @@ async def sell(
             (new_qty, user_id, ticker),
         )
     await DBService.pool.commit()
-    repaid, _ = await apply_income(user_id, proceeds)
+    repaid, _ = await apply_income(user_id, received)
     now = _now()
     await DBService.pool.execute(
         "UPDATE stocks SET price = ?, updated_at = ? WHERE ticker = ?",
@@ -1245,10 +1268,8 @@ async def sell(
         (ticker, exec_price, now),
     )
     await DBService.pool.commit()
-    royalty = 0
-    if stock.owner_id is not None and stock.owner_id != user_id:
-        royalty = await _credit_royalty(stock.owner_id, proceeds)
-    return exec_price, proceeds, repaid, rate, royalty
+    await _pay_royalty(stock.owner_id, royalty)
+    return exec_price, received, repaid, rate, royalty
 
 
 async def get_portfolio(user_id: int) -> list[dict]:

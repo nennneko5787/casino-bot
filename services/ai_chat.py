@@ -34,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 import dotenv
 
 from services.database import DBService
+from services.money import MAX_BALANCE
 
 dotenv.load_dotenv()
 
@@ -554,7 +555,8 @@ async def refund(user_id: int, price: int) -> None:
         "INSERT OR IGNORE INTO users(id) VALUES (?)", (user_id,)
     )
     await DBService.pool.execute(
-        "UPDATE users SET amount = amount + ? WHERE id = ?", (price, user_id)
+        "UPDATE users SET amount = MIN(amount + ?, ?) WHERE id = ?",
+        (price, MAX_BALANCE, user_id),
     )
     await DBService.pool.commit()
 

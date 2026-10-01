@@ -22,6 +22,7 @@ from discord.ext import commands, tasks
 from objects.exceptions import AmountNotEnough
 from services import missions, stocks
 from services.admin import admin_only
+from services.database import DBService
 from services.loan import repay_note
 from services.message import amountName, buildAmountText, buildGetAmountText
 from services.stock_chart import (
@@ -228,6 +229,10 @@ class StockCog(commands.Cog):
                     await stocks.randomize_params()
         except Exception:
             logger.exception("株価の定期更新に失敗")
+            # 途中まで書き込んだ値を次のtickや他機能の commit に
+            # 巻き込ませないよう、必ず破棄する
+            with suppress(Exception):
+                await DBService.pool.rollback()
             return
 
     @tasks.loop(minutes=TICK_INTERVAL_MINUTES)

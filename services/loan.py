@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from services.database import DBService
 from services.message import buildAmountText
+from services.money import MAX_BALANCE
 
 WALL_STEP = 1000
 FEE_RATE = 0.10
@@ -120,16 +121,16 @@ async def apply_income(user_id: int, amount: int) -> tuple[int, int]:
     _, debt = await _balance_debt(user_id)
     if amount <= 0 or debt <= 0:
         await DBService.pool.execute(
-            "UPDATE users SET amount = amount + ? WHERE id = ?",
-            (amount, user_id),
+            "UPDATE users SET amount = MIN(amount + ?, ?) WHERE id = ?",
+            (amount, MAX_BALANCE, user_id),
         )
         await DBService.pool.commit()
         return 0, amount
     repaid = min(debt, amount)
     rest = amount - repaid
     await DBService.pool.execute(
-        "UPDATE users SET amount = amount + ?, debt = debt - ? WHERE id = ?",
-        (rest, repaid, user_id),
+        "UPDATE users SET amount = MIN(amount + ?, ?), debt = debt - ? WHERE id = ?",
+        (rest, MAX_BALANCE, repaid, user_id),
     )
     await DBService.pool.commit()
     return repaid, rest
@@ -145,9 +146,10 @@ def repay_note(repaid: int) -> str:
 async def net_worth_ranking(limit: int = RANKING_LIMIT, *, poor: bool = False) -> list:
     """総資産 (残高 + 株評価額 − 借金) の番付。[(user_id, net)] を順位順で返す。"""
     order = "ASC" if poor else "DESC"
+    # 評価額の合計が int64 を超えると SUM が落ちるので TOTAL (REAL) を使う
     cursor = await DBService.pool.execute(
         "SELECT u.id AS id, "
-        "u.amount + COALESCE(SUM(h.qty * s.price), 0) - u.debt AS net "
+        "u.amount + COALESCE(TOTAL(h.qty * s.price), 0) - u.debt AS net "
         "FROM users u "
         "LEFT JOIN holdings h ON h.user_id = u.id "
         "LEFT JOIN stocks s ON s.ticker = h.ticker "

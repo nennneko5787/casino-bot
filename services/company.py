@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta, timezone
 
 from services.database import DBService
+from services.money import MAX_BALANCE
 from services.stocks import SQLITE_MAX_INT, get_stock, normalize_ticker
 
 JST = timezone(timedelta(hours=9))
@@ -252,7 +253,7 @@ async def _user_balance(user_id: int) -> int:
 
 
 async def _credit_user(user_id: int, amount: int) -> None:
-    """個人残高に加算 (上限 SQLITE_MAX_INT で丸める)。"""
+    """個人残高に加算 (上限 MAX_BALANCE で丸める)。"""
     if amount < 1:
         return
     await DBService.pool.execute(
@@ -266,7 +267,7 @@ async def _credit_user(user_id: int, amount: int) -> None:
     balance = int(row["amount"]) if row else 100
     await DBService.pool.execute(
         "UPDATE users SET amount = ? WHERE id = ?",
-        (min(balance + amount, SQLITE_MAX_INT), user_id),
+        (min(balance + amount, MAX_BALANCE), user_id),
     )
 
 

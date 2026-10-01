@@ -7,6 +7,11 @@ from objects.exceptions import AccountCreationFailed, CasinoBaseException
 from objects.user import User
 from services.database import DBService
 
+# 1人あたりの残高上限。
+# SQLite INTEGER の max (9223372036854775807) は SUM などの集約で
+# integer overflow を起こすため、十分手前で頭打ちにする。
+MAX_BALANCE = 10**15
+
 
 async def createUser(
     user: discord.User | discord.Member, *, cursor: aiosqlite.Cursor
@@ -42,7 +47,7 @@ async def saveUser(user: User) -> User:
         await DBService.pool.execute(
             "UPDATE users SET amount = ? WHERE id = ? RETURNING *",
             (
-                user.amount,
+                min(user.amount, MAX_BALANCE),
                 user.id,
             ),
         )
